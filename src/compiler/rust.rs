@@ -62,26 +62,6 @@ use std::time;
 
 use crate::errors::*;
 
-/// CARGO_* environment variables known to contain absolute paths that should
-/// have basedir prefixes stripped for cross-machine cache portability.
-/// See: https://doc.rust-lang.org/cargo/reference/environment-variables.html
-const CARGO_PATH_ENV_VARS: &[&str] = &[
-    "CARGO_MANIFEST_DIR",
-    "CARGO_MANIFEST_PATH",
-    "CARGO_TARGET_TMPDIR",
-    "CARGO_WORKSPACE_DIR",
-];
-
-/// Prefixes of CARGO_* environment variables that contain absolute paths.
-/// Variables matching these prefixes have their values basedir-stripped.
-const CARGO_PATH_ENV_PREFIXES: &[&str] = &["CARGO_BIN_EXE_"];
-
-/// Returns true if a CARGO_* env var is known to contain an absolute path.
-fn is_cargo_path_var(var: &str) -> bool {
-    CARGO_PATH_ENV_VARS.contains(&var)
-        || CARGO_PATH_ENV_PREFIXES.iter().any(|&p| var.starts_with(p))
-}
-
 /// Strip a basedir prefix from a byte slice, returning the relative portion.
 /// Basedirs are pre-normalized with trailing `/` (see config.rs), so the
 /// result is a clean relative path. On Windows, the value is normalized
@@ -1610,16 +1590,15 @@ where
 
             var.hash(&mut HashToDigest { digest: &mut m });
             m.update(b"=");
-            // Strip basedir prefixes from path-containing CARGO_* vars
-            // to enable cross-machine cache hits.
-            let var_str = var.to_string_lossy();
-            if is_cargo_path_var(&var_str) {
-                let val_bytes = val.as_encoded_bytes();
-                strip_basedir_prefix(val_bytes, basedirs)
-                    .hash(&mut HashToDigest { digest: &mut m });
-            } else {
-                val.hash(&mut HashToDigest { digest: &mut m });
-            }
+            // Strip basedir prefixes from every CARGO_* var value. Hand-coded
+            // allowlists miss path-bearing vars set by surrounding tooling
+            // (e.g., devenv's CARGO_INSTALL_ROOT, which is per-project so it
+            // would otherwise differ between worktrees and break cache keys
+            // for every workspace crate). For values without a basedir
+            // prefix, strip is a no-op.
+            let val_bytes = val.as_encoded_bytes();
+            strip_basedir_prefix(val_bytes, basedirs)
+                .hash(&mut HashToDigest { digest: &mut m });
         }
         // 9. The cwd of the compile. This will wind up in the rlib.
         // Strip basedir prefix for cross-machine cache portability.
