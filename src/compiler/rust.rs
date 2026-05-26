@@ -1511,7 +1511,19 @@ where
         // A few argument types are not passed in a deterministic order
         // by cargo: --extern, -L, --cfg. We'll filter those out, sort them,
         // and append them to the rest of the arguments.
-        let args = {
+        // Build the args byte blob for hashing. Strip basedirs from each
+        // token BEFORE concatenation so absolute paths embedded as separate
+        // tokens (e.g., the value of `--remap-path-prefix`, which cargo emits
+        // as the two tokens `["--remap-path-prefix", "/abs/path=virtual"]`)
+        // are caught: each token starts at position 0, which is always a
+        // boundary. Without this, the `/` would be preceded by the trailing
+        // letter of the previous token and the boundary scan would miss.
+        //
+        // Arguments like --remap-path-prefix=PATH=..., -Clinker=PATH, etc.
+        // contain absolute paths that differ across machines/worktrees. See
+        // mozilla/sccache#2652.
+        let mut args_bytes: Vec<u8> = Vec::new();
+        {
             let (mut sortables, rest): (Vec<_>, Vec<_>) = os_string_arguments
                 .iter()
                 // We exclude a few arguments from the hash:
@@ -1535,20 +1547,16 @@ where
                 // out, sort them, and append them to the rest of the arguments.
                 .partition(|&(arg, _)| arg == "--cfg");
             sortables.sort();
-            rest.into_iter()
+            for tok in rest
+                .into_iter()
                 .chain(sortables)
                 .flat_map(|(arg, val)| iter::once(arg).chain(val.as_ref()))
-                .fold(OsString::new(), |mut a, b| {
-                    a.push(b);
-                    a
-                })
-        };
-        // Strip basedir prefixes from arguments before hashing. Arguments like
-        // --remap-path-prefix=/abs/path=..., -Clinker=/abs/path, etc. contain
-        // absolute paths that differ across machines. See mozilla/sccache#2652.
-        let args_bytes = args.as_encoded_bytes();
-        crate::util::strip_basedirs(args_bytes, basedirs)
-            .hash(&mut HashToDigest { digest: &mut m });
+            {
+                let stripped = crate::util::strip_basedirs(tok.as_encoded_bytes(), basedirs);
+                args_bytes.extend_from_slice(&stripped);
+            }
+        }
+        args_bytes.hash(&mut HashToDigest { digest: &mut m });
         // 4. The digest of all source files (this includes src file from cmdline).
         // 5. The digest of all files listed on the commandline (self.externs).
         // 6. The digest of all static libraries listed on the commandline (self.staticlibs).

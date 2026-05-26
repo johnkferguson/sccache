@@ -1128,11 +1128,19 @@ impl BasedirEntry {
     /// non-literal entry.
     pub fn matched_prefix_len(&self, path: &[u8]) -> Option<usize> {
         if self.is_literal {
+            // Literal fast path: byte-prefix match against normalized (with trailing /).
             if path.starts_with(&self.normalized) {
-                Some(self.normalized.len())
-            } else {
-                None
+                return Some(self.normalized.len());
             }
+            // Also accept an exact match against the basedir minus the trailing
+            // slash. Callers strip path-bearing flags like
+            // `--remap-path-prefix=/abs/path=...`; when the candidate ends
+            // right at the basedir there's no trailing `/` to anchor on.
+            let no_slash = &self.normalized[..self.normalized.len() - 1];
+            if path == no_slash {
+                return Some(no_slash.len());
+            }
+            None
         } else {
             let path_str = std::str::from_utf8(path).ok()?;
             let mut best: Option<usize> = None;
@@ -1145,6 +1153,12 @@ impl BasedirEntry {
                         best = Some(i + 1);
                     }
                 }
+            }
+            // Also try the whole path as a candidate. Same reasoning as the
+            // literal exact-match arm: the candidate may end exactly at the
+            // matched directory with no trailing `/` to anchor the loop.
+            if self.pattern.matches(path_str) && best.is_none_or(|b| path.len() > b) {
+                best = Some(path.len());
             }
             best
         }
@@ -2127,6 +2141,43 @@ mod tests {
             b"# 1 \"/r/proj/src/main.c\" # 2 \"/r/proj/worktrees/proj/wt-a/proj/src/main.c\"";
         let output = super::strip_basedirs(input, &basedirs);
         let expected = b"# 1 \"src/main.c\" # 2 \"src/main.c\"";
+        assert_eq!(&*output, expected);
+    }
+
+    #[test]
+    fn test_basedir_glob_exact_match_no_trailing_slash() {
+        // Candidate ends right at the matched directory (no trailing `/`).
+        // Mirrors how `strip_basedirs` extracts substrings from arg blobs like
+        // `--remap-path-prefix=/r/proj/worktrees/proj/wt-a/proj=/v`.
+        let e =
+            super::BasedirEntry::from_normalized(b"/r/proj/worktrees/proj/*/proj/".to_vec())
+                .unwrap();
+        let path = b"/r/proj/worktrees/proj/wt-a/proj";
+        let n = e.matched_prefix_len(path).expect("should match whole path");
+        assert_eq!(n, path.len());
+    }
+
+    #[test]
+    fn test_basedir_literal_exact_match_no_trailing_slash() {
+        let e = super::BasedirEntry::from_normalized(b"/home/user/project/".to_vec()).unwrap();
+        let path = b"/home/user/project";
+        let n = e.matched_prefix_len(path).expect("should match whole path");
+        assert_eq!(n, path.len());
+    }
+
+    #[test]
+    fn test_strip_basedirs_remap_path_prefix_form() {
+        // The motivating case: cargo's `--remap-path-prefix=$PWD=/proj` arg
+        // when $PWD is a worktree path. The `=` boundary triggers the scan,
+        // and the candidate ends at the next `=` — no trailing `/`. With the
+        // exact-match arm in `matched_prefix_len`, this strips correctly.
+        let entry =
+            super::BasedirEntry::from_normalized(b"/r/proj/worktrees/proj/*/proj/".to_vec())
+                .unwrap();
+        let input =
+            b"--remap-path-prefix=/r/proj/worktrees/proj/wt-a/proj=/v --other-flag";
+        let output = super::strip_basedirs(input, std::slice::from_ref(&entry));
+        let expected = b"--remap-path-prefix==/v --other-flag";
         assert_eq!(&*output, expected);
     }
 
