@@ -28,6 +28,12 @@
 
         cargoLock = {
           lockFile = ./Cargo.lock;
+          # opendal is patched to a git fork; cargo-vendor needs an explicit
+          # hash. The first crate name in each git source is enough — nix
+          # treats it as the key for the whole source.
+          outputHashes = {
+            "opendal-0.55.0" = "sha256-Fcf4Msv4GBwQ4xcm+vg6aLbHndxAOPumW56BCXyUZpU=";
+          };
         };
 
         nativeBuildInputs = [final.pkg-config];

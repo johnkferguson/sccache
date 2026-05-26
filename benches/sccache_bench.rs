@@ -22,7 +22,7 @@
 use divan::{Bencher, black_box};
 use sccache::cache::{CacheRead, CacheWrite};
 use sccache::lru_disk_cache::LruCache;
-use sccache::util::{Digest, TimeMacroFinder, normalize_win_path, strip_basedirs};
+use sccache::util::{BasedirEntry, Digest, TimeMacroFinder, normalize_win_path, strip_basedirs};
 use std::io::Cursor;
 
 // =============================================================================
@@ -855,8 +855,9 @@ fn normalize_win_path_typical(bencher: Bencher) {
 /// Benchmark strip_basedirs with typical preprocessor output
 #[divan::bench]
 fn strip_basedirs_typical(bencher: Bencher) {
-    let basedir = b"/home/user/project/".to_vec();
-    let output = generate_preprocessor_output_with_paths(500, &basedir);
+    let basedir_bytes = b"/home/user/project/".to_vec();
+    let output = generate_preprocessor_output_with_paths(500, &basedir_bytes);
+    let basedir = BasedirEntry::from_normalized(basedir_bytes).unwrap();
 
     bencher.bench(|| {
         black_box(strip_basedirs(
@@ -869,14 +870,18 @@ fn strip_basedirs_typical(bencher: Bencher) {
 /// Benchmark strip_basedirs with multiple basedirs
 #[divan::bench]
 fn strip_basedirs_multiple(bencher: Bencher) {
-    let basedirs = vec![
-        b"/home/user/project/".to_vec(),
-        b"/usr/include/".to_vec(),
-        b"/opt/toolchain/include/".to_vec(),
+    let basedir_bytes: [&[u8]; 3] = [
+        b"/home/user/project/",
+        b"/usr/include/",
+        b"/opt/toolchain/include/",
     ];
+    let basedirs: Vec<BasedirEntry> = basedir_bytes
+        .iter()
+        .map(|b| BasedirEntry::from_normalized(b.to_vec()).unwrap())
+        .collect();
     let mut output = Vec::new();
     for i in 0..500 {
-        let basedir = &basedirs[i % basedirs.len()];
+        let basedir = basedir_bytes[i % basedir_bytes.len()];
         output.extend_from_slice(b"# 1 \"");
         output.extend_from_slice(basedir);
         output.extend_from_slice(format!("file{}.h\"\n", i).as_bytes());

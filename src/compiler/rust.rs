@@ -27,7 +27,7 @@ use crate::dist::pkg;
 use crate::lru_disk_cache::{LruCache, Meter};
 use crate::mock_command::{CommandCreatorSync, RunCommand};
 use crate::util::{Digest, fmt_duration_as_secs, hash_all, hash_all_archives, run_input_output};
-use crate::util::{HashToDigest, OsStrExt};
+use crate::util::{BasedirEntry, HashToDigest, OsStrExt, longest_basedir_match};
 use crate::{counted_array, dist};
 use async_trait::async_trait;
 use filetime::FileTime;
@@ -62,32 +62,15 @@ use std::time;
 
 use crate::errors::*;
 
-/// CARGO_* environment variables known to contain absolute paths that should
-/// have basedir prefixes stripped for cross-machine cache portability.
-/// See: https://doc.rust-lang.org/cargo/reference/environment-variables.html
-const CARGO_PATH_ENV_VARS: &[&str] = &[
-    "CARGO_MANIFEST_DIR",
-    "CARGO_MANIFEST_PATH",
-    "CARGO_TARGET_TMPDIR",
-    "CARGO_WORKSPACE_DIR",
-];
-
-/// Prefixes of CARGO_* environment variables that contain absolute paths.
-/// Variables matching these prefixes have their values basedir-stripped.
-const CARGO_PATH_ENV_PREFIXES: &[&str] = &["CARGO_BIN_EXE_"];
-
-/// Returns true if a CARGO_* env var is known to contain an absolute path.
-fn is_cargo_path_var(var: &str) -> bool {
-    CARGO_PATH_ENV_VARS.contains(&var)
-        || CARGO_PATH_ENV_PREFIXES.iter().any(|&p| var.starts_with(p))
-}
-
 /// Strip a basedir prefix from a byte slice, returning the relative portion.
 /// Basedirs are pre-normalized with trailing `/` (see config.rs), so the
 /// result is a clean relative path. On Windows, the value is normalized
 /// (lowercase + forward slashes) before comparison since basedirs are stored
 /// normalized.
-fn strip_basedir_prefix<'a>(value: &'a [u8], basedirs: &[Vec<u8>]) -> Cow<'a, [u8]> {
+///
+/// When multiple basedirs match the value, the longest matched prefix wins.
+/// Glob basedirs are supported via the same API; see [`BasedirEntry`].
+fn strip_basedir_prefix<'a>(value: &'a [u8], basedirs: &[BasedirEntry]) -> Cow<'a, [u8]> {
     if basedirs.is_empty() {
         return Cow::Borrowed(value);
     }
@@ -97,15 +80,15 @@ fn strip_basedir_prefix<'a>(value: &'a [u8], basedirs: &[Vec<u8>]) -> Cow<'a, [u
     #[cfg(not(target_os = "windows"))]
     let normalized = value;
 
-    for basedir in basedirs {
-        if normalized.starts_with(basedir) {
+    match longest_basedir_match(&normalized, basedirs) {
+        Some(len) => {
             #[cfg(target_os = "windows")]
-            return Cow::Owned(normalized[basedir.len()..].to_vec());
+            return Cow::Owned(normalized[len..].to_vec());
             #[cfg(not(target_os = "windows"))]
-            return Cow::Borrowed(&value[basedir.len()..]);
+            return Cow::Borrowed(&value[len..]);
         }
+        None => Cow::Borrowed(value),
     }
-    Cow::Borrowed(value)
 }
 
 #[cfg(feature = "dist-client")]
@@ -1508,7 +1491,19 @@ where
         // A few argument types are not passed in a deterministic order
         // by cargo: --extern, -L, --cfg. We'll filter those out, sort them,
         // and append them to the rest of the arguments.
-        let args = {
+        // Build the args byte blob for hashing. Strip basedirs from each
+        // token BEFORE concatenation so absolute paths embedded as separate
+        // tokens (e.g., the value of `--remap-path-prefix`, which cargo emits
+        // as the two tokens `["--remap-path-prefix", "/abs/path=virtual"]`)
+        // are caught: each token starts at position 0, which is always a
+        // boundary. Without this, the `/` would be preceded by the trailing
+        // letter of the previous token and the boundary scan would miss.
+        //
+        // Arguments like --remap-path-prefix=PATH=..., -Clinker=PATH, etc.
+        // contain absolute paths that differ across machines/worktrees. See
+        // mozilla/sccache#2652.
+        let mut args_bytes: Vec<u8> = Vec::new();
+        {
             let (mut sortables, rest): (Vec<_>, Vec<_>) = os_string_arguments
                 .iter()
                 // We exclude a few arguments from the hash:
@@ -1532,20 +1527,16 @@ where
                 // out, sort them, and append them to the rest of the arguments.
                 .partition(|&(arg, _)| arg == "--cfg");
             sortables.sort();
-            rest.into_iter()
+            for tok in rest
+                .into_iter()
                 .chain(sortables)
                 .flat_map(|(arg, val)| iter::once(arg).chain(val.as_ref()))
-                .fold(OsString::new(), |mut a, b| {
-                    a.push(b);
-                    a
-                })
-        };
-        // Strip basedir prefixes from arguments before hashing. Arguments like
-        // --remap-path-prefix=/abs/path=..., -Clinker=/abs/path, etc. contain
-        // absolute paths that differ across machines. See mozilla/sccache#2652.
-        let args_bytes = args.as_encoded_bytes();
-        crate::util::strip_basedirs(args_bytes, basedirs)
-            .hash(&mut HashToDigest { digest: &mut m });
+            {
+                let stripped = crate::util::strip_basedirs(tok.as_encoded_bytes(), basedirs);
+                args_bytes.extend_from_slice(&stripped);
+            }
+        }
+        args_bytes.hash(&mut HashToDigest { digest: &mut m });
         // 4. The digest of all source files (this includes src file from cmdline).
         // 5. The digest of all files listed on the commandline (self.externs).
         // 6. The digest of all static libraries listed on the commandline (self.staticlibs).
@@ -1599,16 +1590,15 @@ where
 
             var.hash(&mut HashToDigest { digest: &mut m });
             m.update(b"=");
-            // Strip basedir prefixes from path-containing CARGO_* vars
-            // to enable cross-machine cache hits.
-            let var_str = var.to_string_lossy();
-            if is_cargo_path_var(&var_str) {
-                let val_bytes = val.as_encoded_bytes();
-                strip_basedir_prefix(val_bytes, basedirs)
-                    .hash(&mut HashToDigest { digest: &mut m });
-            } else {
-                val.hash(&mut HashToDigest { digest: &mut m });
-            }
+            // Strip basedir prefixes from every CARGO_* var value. Hand-coded
+            // allowlists miss path-bearing vars set by surrounding tooling
+            // (e.g., devenv's CARGO_INSTALL_ROOT, which is per-project so it
+            // would otherwise differ between worktrees and break cache keys
+            // for every workspace crate). For values without a basedir
+            // prefix, strip is a no-op.
+            let val_bytes = val.as_encoded_bytes();
+            strip_basedir_prefix(val_bytes, basedirs)
+                .hash(&mut HashToDigest { digest: &mut m });
         }
         // 9. The cwd of the compile. This will wind up in the rlib.
         // Strip basedir prefix for cross-machine cache portability.
@@ -3975,7 +3965,7 @@ proc_macro false
         args: &[&'static str],
         env_vars: &[(OsString, OsString)],
         pre_func: F,
-        basedirs: Vec<Vec<u8>>,
+        basedirs: Vec<BasedirEntry>,
     ) -> String
     where
         F: Fn(&Path) -> Result<()>,
@@ -4064,7 +4054,8 @@ proc_macro false
         let basedir = crate::util::normalize_win_path(&basedir);
         let mut basedir = basedir;
         basedir.push(b'/');
-        let key_with = hash_key_with_basedirs(&f, args, &env_vars, nothing, vec![basedir]);
+        let basedir_entry = BasedirEntry::from_normalized(basedir).unwrap();
+        let key_with = hash_key_with_basedirs(&f, args, &env_vars, nothing, vec![basedir_entry]);
 
         // The keys should differ because basedirs changes the hash
         assert_ne!(key_without, key_with, "basedirs should change the hash key");
@@ -4101,9 +4092,11 @@ proc_macro false
         let basedir = crate::util::normalize_win_path(&basedir);
         let mut basedir = basedir;
         basedir.push(b'/');
+        let basedir_entry = BasedirEntry::from_normalized(basedir).unwrap();
 
-        let key1 = hash_key_with_basedirs(&f, args, &env_vars, nothing, vec![basedir.clone()]);
-        let key2 = hash_key_with_basedirs(&f, args, &env_vars, nothing, vec![basedir]);
+        let key1 =
+            hash_key_with_basedirs(&f, args, &env_vars, nothing, vec![basedir_entry.clone()]);
+        let key2 = hash_key_with_basedirs(&f, args, &env_vars, nothing, vec![basedir_entry]);
 
         assert_eq!(key1, key2, "Same basedir should produce deterministic hash");
     }
