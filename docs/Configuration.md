@@ -24,8 +24,7 @@ server_startup_timeout_ms = 10000
 # syntax (per the `glob` crate): `*` matches any sequence of non-`/`
 # characters within a single path component; `**` matches zero or more
 # path components; `?` matches a single character; `[abc]` matches a
-# character class. Glob entries only affect Rust hash keys; C/C++
-# preprocessor-output stripping considers literal entries only.
+# character class.
 #
 # Example:
 #   basedirs = ["/home/user/project"] results in the path prefix rewrite:

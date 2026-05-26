@@ -1177,24 +1177,25 @@ pub fn longest_basedir_match(path: &[u8], basedirs: &[BasedirEntry]) -> Option<u
     best
 }
 
-/// Strip base directories from absolute paths in preprocessor output.
+/// Strip base directories from absolute paths in a byte blob.
 ///
-/// This function searches for basedir paths in the preprocessor output and
-/// replaces them with relative path markers. When multiple basedirs are provided,
-/// the longest matching prefix is used. This is similar to ccache's CCACHE_BASEDIR.
+/// Searches the blob for paths matching any basedir entry (literal or glob)
+/// and replaces them with relative path markers. When multiple basedirs match
+/// a given position, the longest match wins.
 ///
-/// Path matching is case-insensitive to handle various filesystem behaviors and build system
-/// configurations uniformly across all operating systems. On Windows, this function also handles
-/// paths with mixed forward and backward slashes, which can occur when different build tools
-/// produce preprocessor output.
+/// Path matching is case-insensitive to handle various filesystem behaviors
+/// and build system configurations uniformly across all operating systems. On
+/// Windows, this function also handles paths with mixed forward and backward
+/// slashes, which can occur when different build tools produce preprocessor
+/// output.
 ///
-/// Only paths that start with one of the basedirs are modified. The paths are expected to be
-/// in the format found in preprocessor output (e.g., `# 1 "/path/to/file"`).
+/// Matches are anchored at a "boundary" — the start of the blob, whitespace,
+/// `"`, `<`, or `=`. `=` is included so command-line args of the form
+/// `--remap-path-prefix=/abs/path=...` have their absolute paths stripped
+/// alongside paths in preprocessor output (`# 1 "/abs/path/..."`).
 ///
-/// **Note:** glob-pattern basedirs are ignored here; only literal entries
-/// participate. C/C++ preprocessor output is a substring search problem and
-/// glob matching doesn't translate naturally. This is a v1 limitation tracked
-/// in the basedirs documentation.
+/// Used for the Rust argv byte blob in compiler/rust.rs and for C/C++
+/// preprocessor output in compiler/preprocessor_cache.rs.
 pub fn strip_basedirs<'a>(
     preprocessor_output: &'a [u8],
     basedirs: &[BasedirEntry],
@@ -1203,46 +1204,81 @@ pub fn strip_basedirs<'a>(
         return Cow::Borrowed(preprocessor_output);
     }
 
-    // C/C++ preprocessor stripping only handles literal basedirs in v1; glob
-    // entries pass through unchanged.
-    let literal_bytes: Vec<&[u8]> = basedirs
-        .iter()
-        .filter(|e| e.is_literal())
-        .map(|e| e.normalized_bytes())
-        .collect();
-    if literal_bytes.is_empty() {
-        return Cow::Borrowed(preprocessor_output);
-    }
-
     trace!(
-        "Stripping basedirs from preprocessor output with length {}",
+        "Stripping basedirs from blob of length {}",
         preprocessor_output.len(),
     );
 
-    // Find all potential matches for each basedir using fast substring search
-    // Store as (position, length, basedir_idx) sorted by position
-    let mut matches: Vec<(usize, usize, usize)> = Vec::new();
     // We must return the original preprocessor output on all platforms,
     // so we only normalize a copy for searching.
     #[cfg(not(target_os = "windows"))]
-    let normalized_output = preprocessor_output;
+    let normalized_output: &[u8] = preprocessor_output;
     #[cfg(target_os = "windows")]
-    let normalized_output = &normalize_win_path(preprocessor_output);
+    let _normalized_owned = normalize_win_path(preprocessor_output);
+    #[cfg(target_os = "windows")]
+    let normalized_output: &[u8] = &_normalized_owned;
 
-    for (idx, basedir) in literal_bytes.iter().enumerate() {
-        // Use memchr's fast substring search
-        let finder = memchr::memmem::find_iter(normalized_output, basedir);
+    let is_boundary_at = |pos: usize| -> bool {
+        pos == 0
+            || matches!(
+                normalized_output[pos - 1],
+                b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'<' | b'='
+            )
+    };
 
-        for pos in finder {
-            // Check if this is a valid boundary (start, whitespace, quote, or '<')
-            let is_boundary = pos == 0
-                || normalized_output[pos - 1].is_ascii_whitespace()
-                || normalized_output[pos - 1] == b'"'
-                || normalized_output[pos - 1] == b'<';
+    // (position, length) of each candidate strip range; combined from both
+    // literal-prefix and glob scans below.
+    let mut matches: Vec<(usize, usize)> = Vec::new();
 
-            if is_boundary {
-                matches.push((pos, basedir.len(), idx));
+    // Literal entries: fast memmem substring search across the whole blob.
+    for entry in basedirs.iter().filter(|e| e.is_literal()) {
+        let basedir = entry.normalized_bytes();
+        for pos in memchr::memmem::find_iter(normalized_output, basedir) {
+            if is_boundary_at(pos) {
+                matches.push((pos, basedir.len()));
             }
+        }
+    }
+
+    // Glob entries: scan boundary `/` positions and try a component-walk match
+    // against the substring rooted there. The substring extends until the next
+    // non-path character so the glob walker has a self-contained candidate.
+    let has_globs = basedirs.iter().any(|e| !e.is_literal());
+    if has_globs {
+        let n = normalized_output.len();
+        let mut pos = 0;
+        while pos < n {
+            if normalized_output[pos] == b'/' && is_boundary_at(pos) {
+                // Extend the candidate path up to the next non-path byte. Path
+                // bytes are anything other than the boundary set + a few extra
+                // characters used as path delimiters in cargo/clang output.
+                let mut end = pos + 1;
+                while end < n
+                    && !matches!(
+                        normalized_output[end],
+                        b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'<' | b'>' | b'=' | b',' | b';' | 0
+                    )
+                {
+                    end += 1;
+                }
+                let candidate = &normalized_output[pos..end];
+                // Across all glob entries, take the longest match at this position.
+                let mut best: Option<usize> = None;
+                for entry in basedirs.iter().filter(|e| !e.is_literal()) {
+                    if let Some(len) = entry.matched_prefix_len(candidate) {
+                        if best.is_none_or(|b| len > b) {
+                            best = Some(len);
+                        }
+                    }
+                }
+                if let Some(len) = best {
+                    matches.push((pos, len));
+                    // skip past the matched region to avoid redundant scanning
+                    pos += len;
+                    continue;
+                }
+            }
+            pos += 1;
         }
     }
 
@@ -1257,16 +1293,10 @@ pub fn strip_basedirs<'a>(
     let mut filtered_matches: Vec<(usize, usize)> = Vec::with_capacity(matches.len());
     let mut last_end = 0;
 
-    for (pos, len, idx) in matches {
+    for (pos, len) in matches {
         if pos >= last_end {
             filtered_matches.push((pos, len));
             last_end = pos + len;
-            trace!(
-                "Matched basedir {} at position {} with length {}",
-                String::from_utf8_lossy(literal_bytes[idx]),
-                pos,
-                len
-            );
         }
     }
 
@@ -2068,5 +2098,46 @@ mod tests {
         // `[` without a closing `]` is invalid glob syntax.
         let err = super::BasedirEntry::from_normalized(b"/home/[unclosed/".to_vec());
         assert!(err.is_err(), "invalid glob should be rejected");
+    }
+
+    // === strip_basedirs: glob-in-blob coverage ===
+
+    #[test]
+    fn test_strip_basedirs_glob_in_blob() {
+        // Args byte blob with absolute paths embedded after `=` (mimics cargo's
+        // --remap-path-prefix output). Glob basedir should strip them.
+        let entry =
+            super::BasedirEntry::from_normalized(b"/r/proj/worktrees/proj/*/proj/".to_vec())
+                .unwrap();
+        let input =
+            b"--foo=/r/proj/worktrees/proj/wt-a/proj/src/lib.rs other=/r/proj/worktrees/proj/wt-b/proj/x.rs";
+        let output = super::strip_basedirs(input, std::slice::from_ref(&entry));
+        let expected = b"--foo=src/lib.rs other=x.rs";
+        assert_eq!(&*output, expected);
+    }
+
+    #[test]
+    fn test_strip_basedirs_mixed_literal_and_glob() {
+        let mk = |s: &[u8]| super::BasedirEntry::from_normalized(s.to_vec()).unwrap();
+        let basedirs = vec![
+            mk(b"/r/proj/"),                            // literal
+            mk(b"/r/proj/worktrees/proj/*/proj/"),      // glob
+        ];
+        let input =
+            b"# 1 \"/r/proj/src/main.c\" # 2 \"/r/proj/worktrees/proj/wt-a/proj/src/main.c\"";
+        let output = super::strip_basedirs(input, &basedirs);
+        let expected = b"# 1 \"src/main.c\" # 2 \"src/main.c\"";
+        assert_eq!(&*output, expected);
+    }
+
+    #[test]
+    fn test_strip_basedirs_glob_no_match_in_blob() {
+        // No path under the glob in the blob: blob is returned unchanged.
+        let entry =
+            super::BasedirEntry::from_normalized(b"/r/proj/worktrees/proj/*/proj/".to_vec())
+                .unwrap();
+        let input = b"--foo=/other/path/file.rs --bar=baz";
+        let output = super::strip_basedirs(input, std::slice::from_ref(&entry));
+        assert_eq!(&*output, input);
     }
 }
