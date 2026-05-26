@@ -381,7 +381,7 @@ pub fn preprocessor_cache_entry_hash_key(
     input_file: &Path,
     plusplus: bool,
     config: PreprocessorCacheModeConfig,
-    basedirs: &[Vec<u8>],
+    basedirs: &[crate::util::BasedirEntry],
 ) -> anyhow::Result<Option<String>> {
     // If you change any of the inputs to the hash, you should change `FORMAT_VERSION`.
     let mut m = Digest::new();
@@ -654,9 +654,11 @@ mod test {
             .map(|dir| {
                 let bytes = dir.path().to_string_lossy().into_owned().into_bytes();
                 #[cfg(target_os = "windows")]
-                return normalize_win_path(&bytes);
+                let mut bytes = normalize_win_path(&bytes);
                 #[cfg(not(target_os = "windows"))]
-                bytes
+                let mut bytes = bytes;
+                bytes.push(b'/');
+                crate::util::BasedirEntry::from_normalized(bytes).unwrap()
             })
             .collect::<Vec<_>>();
 

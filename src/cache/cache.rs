@@ -51,6 +51,7 @@ use crate::cache::webdav::WebdavCache;
 use crate::compiler::PreprocessorCacheEntry;
 use crate::config::Config;
 use crate::config::{self, CacheType, PreprocessorCacheModeConfig};
+use crate::util::BasedirEntry;
 use async_trait::async_trait;
 use bytes::Bytes;
 
@@ -134,7 +135,7 @@ pub trait Storage: Send + Sync {
         PreprocessorCacheModeConfig::default()
     }
     /// Return the base directories for path normalization if configured
-    fn basedirs(&self) -> &[Vec<u8>] {
+    fn basedirs(&self) -> &[BasedirEntry] {
         &[]
     }
     /// Return the preprocessor cache entry for a given preprocessor key,
@@ -172,7 +173,7 @@ pub trait Storage: Send + Sync {
 ))]
 pub struct RemoteStorage {
     operator: opendal::Operator,
-    basedirs: Vec<Vec<u8>>,
+    basedirs: Vec<BasedirEntry>,
     /// Optional transform applied to every key (including health-check paths)
     /// before it is sent to the operator.  Used by backends like Vercel Artifacts
     /// that only accept alphanumeric artifact IDs.
@@ -191,7 +192,7 @@ pub struct RemoteStorage {
     feature = "cos"
 ))]
 impl RemoteStorage {
-    pub fn new(operator: opendal::Operator, basedirs: Vec<Vec<u8>>) -> Self {
+    pub fn new(operator: opendal::Operator, basedirs: Vec<BasedirEntry>) -> Self {
         Self {
             operator,
             basedirs,
@@ -201,7 +202,7 @@ impl RemoteStorage {
 
     pub fn new_with_key_transform(
         operator: opendal::Operator,
-        basedirs: Vec<Vec<u8>>,
+        basedirs: Vec<BasedirEntry>,
         key_transform: fn(&str) -> String,
     ) -> Self {
         Self {
@@ -325,7 +326,7 @@ impl Storage for RemoteStorage {
         Ok(None)
     }
 
-    fn basedirs(&self) -> &[Vec<u8>] {
+    fn basedirs(&self) -> &[BasedirEntry] {
         &self.basedirs
     }
 
@@ -389,7 +390,7 @@ impl Storage for RemoteStorage {
 ))]
 pub fn build_single_cache(
     cache_type: &CacheType,
-    basedirs: &[Vec<u8>],
+    basedirs: &[BasedirEntry],
     _pool: &tokio::runtime::Handle,
 ) -> Result<Arc<dyn Storage>> {
     match cache_type {
@@ -727,7 +728,10 @@ mod test {
         .build()
         .expect("Failed to create S3 cache operator");
 
-        let basedirs = vec![b"/home/user/project".to_vec(), b"/opt/build".to_vec()];
+        let basedirs = vec![
+            BasedirEntry::from_normalized(b"/home/user/project/".to_vec()).unwrap(),
+            BasedirEntry::from_normalized(b"/opt/build/".to_vec()).unwrap(),
+        ];
 
         // Wrap with OperatorStorage
         let storage = RemoteStorage::new(operator, basedirs.clone());
@@ -735,8 +739,11 @@ mod test {
         // Verify basedirs are stored and retrieved correctly
         assert_eq!(storage.basedirs(), basedirs.as_slice());
         assert_eq!(storage.basedirs().len(), 2);
-        assert_eq!(storage.basedirs()[0], b"/home/user/project".to_vec());
-        assert_eq!(storage.basedirs()[1], b"/opt/build".to_vec());
+        assert_eq!(
+            storage.basedirs()[0].normalized_bytes(),
+            b"/home/user/project/"
+        );
+        assert_eq!(storage.basedirs()[1].normalized_bytes(), b"/opt/build/");
     }
 
     #[test]
@@ -753,7 +760,7 @@ mod test {
         )
         .expect("Failed to create Redis cache operator");
 
-        let basedirs = vec![b"/workspace".to_vec()];
+        let basedirs = vec![BasedirEntry::from_normalized(b"/workspace/".to_vec()).unwrap()];
 
         // Wrap with OperatorStorage
         let storage = RemoteStorage::new(operator, basedirs.clone());

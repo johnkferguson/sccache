@@ -15,6 +15,7 @@
 use crate::cache::{Cache, CacheWrite, Storage};
 use crate::config::PreprocessorCacheModeConfig;
 use crate::errors::*;
+use crate::util::BasedirEntry;
 use async_trait::async_trait;
 use futures::channel::mpsc;
 use std::sync::Arc;
@@ -28,7 +29,7 @@ pub struct MockStorage {
     tx: mpsc::UnboundedSender<Result<Cache>>,
     delay: Option<Duration>,
     preprocessor_cache_mode: bool,
-    basedirs: Vec<Vec<u8>>,
+    basedirs: Vec<BasedirEntry>,
 }
 
 impl MockStorage {
@@ -48,7 +49,7 @@ impl MockStorage {
     pub(crate) fn with_basedirs(
         delay: Option<Duration>,
         preprocessor_cache_mode: bool,
-        basedirs: Vec<Vec<u8>>,
+        basedirs: Vec<BasedirEntry>,
     ) -> MockStorage {
         let (tx, rx) = mpsc::unbounded();
         Self {
@@ -93,7 +94,7 @@ impl Storage for MockStorage {
     async fn max_size(&self) -> Result<Option<u64>> {
         Ok(None)
     }
-    fn basedirs(&self) -> &[Vec<u8>] {
+    fn basedirs(&self) -> &[BasedirEntry] {
         &self.basedirs
     }
     fn preprocessor_cache_mode_config(&self) -> PreprocessorCacheModeConfig {

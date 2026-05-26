@@ -28,6 +28,7 @@ use crate::errors::*;
 use super::lazy_disk_cache::LazyDiskCache;
 use super::utils::normalize_key;
 use crate::config::PreprocessorCacheModeConfig;
+use crate::util::BasedirEntry;
 
 /// A cache that stores entries at local disk paths.
 pub struct DiskCache {
@@ -38,7 +39,7 @@ pub struct DiskCache {
     preprocessor_cache_mode_config: PreprocessorCacheModeConfig,
     preprocessor_cache: Arc<Mutex<LazyDiskCache>>,
     rw_mode: CacheMode,
-    basedirs: Vec<Vec<u8>>,
+    basedirs: Vec<BasedirEntry>,
     use_uncompressed: bool,
 }
 
@@ -50,7 +51,7 @@ impl DiskCache {
         pool: &tokio::runtime::Handle,
         preprocessor_cache_mode_config: PreprocessorCacheModeConfig,
         rw_mode: CacheMode,
-        basedirs: Vec<Vec<u8>>,
+        basedirs: Vec<BasedirEntry>,
         file_clone: bool,
     ) -> DiskCache {
         let use_uncompressed = if file_clone {
@@ -324,7 +325,7 @@ impl Storage for DiskCache {
     fn preprocessor_cache_mode_config(&self) -> PreprocessorCacheModeConfig {
         self.preprocessor_cache_mode_config
     }
-    fn basedirs(&self) -> &[Vec<u8>] {
+    fn basedirs(&self) -> &[BasedirEntry] {
         &self.basedirs
     }
     async fn get_preprocessor_cache_entry(&self, key: &str) -> Result<Option<Box<dyn ReadSeek>>> {

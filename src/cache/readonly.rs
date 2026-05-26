@@ -19,6 +19,7 @@ use crate::cache::{Cache, CacheMode, CacheWrite, Storage};
 use crate::compiler::PreprocessorCacheEntry;
 use crate::config::PreprocessorCacheModeConfig;
 use crate::errors::*;
+use crate::util::BasedirEntry;
 use bytes::Bytes;
 
 pub struct ReadOnlyStorage(pub Arc<dyn Storage>);
@@ -70,7 +71,7 @@ impl Storage for ReadOnlyStorage {
     }
 
     /// Return the base directories for path normalization if configured
-    fn basedirs(&self) -> &[Vec<u8>] {
+    fn basedirs(&self) -> &[BasedirEntry] {
         self.0.basedirs()
     }
 
@@ -152,8 +153,8 @@ mod test {
         std::fs::create_dir(&cache_dir).unwrap();
 
         let basedirs = vec![
-            b"/home/user/project".to_vec(),
-            b"/home/user/workspace".to_vec(),
+            BasedirEntry::from_normalized(b"/home/user/project/".to_vec()).unwrap(),
+            BasedirEntry::from_normalized(b"/home/user/workspace/".to_vec()).unwrap(),
         ];
 
         let disk_cache = crate::cache::disk::DiskCache::new(

@@ -17,6 +17,7 @@ use blake3::Hasher as blake3_Hasher;
 use byteorder::{BigEndian, ByteOrder};
 use fs::File;
 use fs_err as fs;
+use glob::Pattern;
 use object::read::archive::ArchiveFile;
 use object::read::macho::{FatArch, MachOFatFile32, MachOFatFile64};
 use serde::{Deserialize, Serialize};
@@ -1058,6 +1059,124 @@ pub fn num_cpus() -> usize {
     std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
 }
 
+/// A single entry in the basedirs list: either a literal absolute path prefix
+/// (today's behavior) or a glob pattern. Literal entries take a fast byte-prefix
+/// path; glob entries do a component-walk match.
+///
+/// Construct via [`BasedirEntry::from_normalized`] after the config-loader has
+/// applied path normalization (trailing `/`, Windows lowercase + forward
+/// slashes). The trailing `/` is included in `normalized` so literal matching
+/// only catches whole path components.
+#[derive(Debug, Clone)]
+pub struct BasedirEntry {
+    /// Compiled glob pattern (used for non-literal entries). For literal
+    /// entries it's still compiled so a single match API works uniformly, but
+    /// the literal fast-path bypasses it.
+    pattern: Pattern,
+    /// True if the original input contains no glob metacharacters (`*`, `?`,
+    /// `[`). The byte-prefix `starts_with` fast path is taken for literal
+    /// entries — semantics are identical to the pre-glob implementation.
+    is_literal: bool,
+    /// Normalized form including trailing `/`. For literal entries this is the
+    /// prefix matched via byte `starts_with`. For glob entries it's the
+    /// original pattern bytes — used for debug/display and so callers that
+    /// need a literal-only view can filter on `is_literal()`.
+    normalized: Vec<u8>,
+}
+
+impl BasedirEntry {
+    /// Build an entry from a normalized basedir (already lower-cased on
+    /// Windows, with a trailing `/`). Fails if the value is not valid UTF-8 or
+    /// if the glob pattern is invalid.
+    pub fn from_normalized(normalized_with_slash: Vec<u8>) -> Result<Self> {
+        let s = std::str::from_utf8(&normalized_with_slash)
+            .with_context(|| "Basedir must be valid UTF-8")?;
+        let is_literal = !s
+            .as_bytes()
+            .iter()
+            .any(|&b| b == b'*' || b == b'?' || b == b'[');
+        // glob::Pattern is `/`-component-aware; the trailing `/` we added in
+        // normalization isn't meaningful to it, so strip for compilation.
+        let pat_str = s.trim_end_matches('/');
+        let pattern = Pattern::new(pat_str)
+            .with_context(|| format!("Invalid basedir glob pattern: {:?}", s))?;
+        Ok(Self {
+            pattern,
+            is_literal,
+            normalized: normalized_with_slash,
+        })
+    }
+
+    pub fn is_literal(&self) -> bool {
+        self.is_literal
+    }
+
+    /// The normalized bytes (trailing `/` included). For glob entries this is
+    /// the original pattern, not a matched path.
+    pub fn normalized_bytes(&self) -> &[u8] {
+        &self.normalized
+    }
+
+    /// Returns the byte length of the matched prefix in `path` (including the
+    /// boundary `/`) if any prefix of `path` is matched by this entry, or
+    /// `None` otherwise.
+    ///
+    /// For literal entries this is equivalent to today's
+    /// `path.starts_with(normalized)` check. For glob entries the longest
+    /// component-aligned prefix of `path` whose canonical form matches the
+    /// pattern is returned. Returns `None` if `path` is not valid UTF-8 for a
+    /// non-literal entry.
+    pub fn matched_prefix_len(&self, path: &[u8]) -> Option<usize> {
+        if self.is_literal {
+            if path.starts_with(&self.normalized) {
+                Some(self.normalized.len())
+            } else {
+                None
+            }
+        } else {
+            let path_str = std::str::from_utf8(path).ok()?;
+            let mut best: Option<usize> = None;
+            // Try prefixes ending at each '/' boundary (excluding leading '/').
+            for (i, &b) in path.iter().enumerate() {
+                if b == b'/' && i > 0 {
+                    let prefix = &path_str[..i];
+                    if self.pattern.matches(prefix) {
+                        // include the boundary '/' in the strip length
+                        best = Some(i + 1);
+                    }
+                }
+            }
+            best
+        }
+    }
+}
+
+impl PartialEq for BasedirEntry {
+    fn eq(&self, other: &Self) -> bool {
+        // glob::Pattern lacks PartialEq, but its compiled form is fully
+        // determined by the source string, which (modulo the trailing `/` we
+        // strip in `from_normalized`) is derivable from `normalized`.
+        self.is_literal == other.is_literal && self.normalized == other.normalized
+    }
+}
+
+impl Eq for BasedirEntry {}
+
+/// Find the longest matched-prefix length across all basedir entries. Used by
+/// callers that strip the matched prefix from a single path (e.g., `cwd`,
+/// individual `CARGO_*` env vars).
+pub fn longest_basedir_match(path: &[u8], basedirs: &[BasedirEntry]) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for entry in basedirs {
+        if let Some(n) = entry.matched_prefix_len(path) {
+            if best.map_or(true, |b| n > b) {
+                best = Some(n);
+            }
+        }
+    }
+    best
+}
+
 /// Strip base directories from absolute paths in preprocessor output.
 ///
 /// This function searches for basedir paths in the preprocessor output and
@@ -1071,8 +1190,27 @@ pub fn num_cpus() -> usize {
 ///
 /// Only paths that start with one of the basedirs are modified. The paths are expected to be
 /// in the format found in preprocessor output (e.g., `# 1 "/path/to/file"`).
-pub fn strip_basedirs<'a>(preprocessor_output: &'a [u8], basedirs: &[Vec<u8>]) -> Cow<'a, [u8]> {
+///
+/// **Note:** glob-pattern basedirs are ignored here; only literal entries
+/// participate. C/C++ preprocessor output is a substring search problem and
+/// glob matching doesn't translate naturally. This is a v1 limitation tracked
+/// in the basedirs documentation.
+pub fn strip_basedirs<'a>(
+    preprocessor_output: &'a [u8],
+    basedirs: &[BasedirEntry],
+) -> Cow<'a, [u8]> {
     if basedirs.is_empty() || preprocessor_output.is_empty() {
+        return Cow::Borrowed(preprocessor_output);
+    }
+
+    // C/C++ preprocessor stripping only handles literal basedirs in v1; glob
+    // entries pass through unchanged.
+    let literal_bytes: Vec<&[u8]> = basedirs
+        .iter()
+        .filter(|e| e.is_literal())
+        .map(|e| e.normalized_bytes())
+        .collect();
+    if literal_bytes.is_empty() {
         return Cow::Borrowed(preprocessor_output);
     }
 
@@ -1091,10 +1229,9 @@ pub fn strip_basedirs<'a>(preprocessor_output: &'a [u8], basedirs: &[Vec<u8>]) -
     #[cfg(target_os = "windows")]
     let normalized_output = &normalize_win_path(preprocessor_output);
 
-    for (idx, basedir_bytes) in basedirs.iter().enumerate() {
-        let basedir = basedir_bytes.as_slice();
+    for (idx, basedir) in literal_bytes.iter().enumerate() {
         // Use memchr's fast substring search
-        let finder = memchr::memmem::find_iter(normalized_output, &basedir);
+        let finder = memchr::memmem::find_iter(normalized_output, basedir);
 
         for pos in finder {
             // Check if this is a valid boundary (start, whitespace, quote, or '<')
@@ -1126,7 +1263,7 @@ pub fn strip_basedirs<'a>(preprocessor_output: &'a [u8], basedirs: &[Vec<u8>]) -
             last_end = pos + len;
             trace!(
                 "Matched basedir {} at position {} with length {}",
-                String::from_utf8_lossy(&basedirs[idx]),
+                String::from_utf8_lossy(literal_bytes[idx]),
                 pos,
                 len
             );
@@ -1543,7 +1680,7 @@ mod tests {
     #[test]
     fn test_strip_basedir_simple() {
         // Simple cases
-        let basedir = b"/home/user/project/".to_vec();
+        let basedir = super::BasedirEntry::from_normalized(b"/home/user/project/".to_vec()).unwrap();
         let input = b"# 1 \"/home/user/project/src/main.c\"\nint main() { return 0; }";
         let output = super::strip_basedirs(input, std::slice::from_ref(&basedir));
         let expected = b"# 1 \"src/main.c\"\nint main() { return 0; }";
@@ -1570,7 +1707,7 @@ mod tests {
         assert_eq!(&*output, input);
 
         // Empty input
-        let basedir = b"/home/user/project/".to_vec();
+        let basedir = super::BasedirEntry::from_normalized(b"/home/user/project/".to_vec()).unwrap();
         let input = b"";
         let output = super::strip_basedirs(input, std::slice::from_ref(&basedir));
         assert_eq!(&*output, input);
@@ -1579,7 +1716,7 @@ mod tests {
     #[test]
     fn test_strip_basedir_not_at_boundary() {
         // basedir should only match at word boundaries
-        let basedir = b"/home/user/".to_vec();
+        let basedir = super::BasedirEntry::from_normalized(b"/home/user/".to_vec()).unwrap();
         let input = b"text/home/user/file.c and \"/home/user/other.c\"";
         let output = super::strip_basedirs(input, std::slice::from_ref(&basedir));
         // Should only replace the second occurrence (after quote)
@@ -1590,14 +1727,14 @@ mod tests {
     #[test]
     fn test_strip_basedir_trailing_slashes() {
         // Without trailing slash
-        let basedir = b"/home/user/project".to_vec();
+        let basedir = super::BasedirEntry::from_normalized(b"/home/user/project".to_vec()).unwrap();
         let input = b"# 1 \"/home/user/project/src/main.c\"";
         let output = super::strip_basedirs(input, std::slice::from_ref(&basedir));
         let expected = b"# 1 \"/src/main.c\""; // Wrong, but expected
         assert_eq!(&*output, expected);
 
         // Trailing slashes aren't ignored, they must be cleaned in config reader
-        let basedir = b"/home/user/project/".to_vec();
+        let basedir = super::BasedirEntry::from_normalized(b"/home/user/project/".to_vec()).unwrap();
         let input = b"# 1 \"/home/user/project/src/main.c\"";
         let output = super::strip_basedirs(input, std::slice::from_ref(&basedir));
         let expected = b"# 1 \"src/main.c\"";
@@ -1606,10 +1743,11 @@ mod tests {
 
     #[test]
     fn test_strip_basedirs_multiple() {
+        let mk = |s: &[u8]| super::BasedirEntry::from_normalized(s.to_vec()).unwrap();
         // Multiple basedirs - should match longest first
         let basedirs = vec![
-            b"/home/user1/project/".to_vec(),
-            b"/home/user2/workspace/".to_vec(),
+            mk(b"/home/user1/project/"),
+            mk(b"/home/user2/workspace/"),
         ];
         let input =
             b"# 1 \"/home/user1/project/src/main.c\"\n# 2 \"/home/user2/workspace/lib/util.c\"";
@@ -1618,7 +1756,7 @@ mod tests {
         assert_eq!(&*output, expected);
 
         // Longest prefix wins
-        let basedirs = vec![b"/home/user/".to_vec(), b"/home/user/project/".to_vec()];
+        let basedirs = vec![mk(b"/home/user/"), mk(b"/home/user/project/")];
         let input = b"# 1 \"/home/user/project/src/main.c\"";
         let output = super::strip_basedirs(input, &basedirs);
         let expected = b"# 1 \"src/main.c\"";
@@ -1629,7 +1767,7 @@ mod tests {
     #[test]
     fn test_strip_basedir_windows_backslashes() {
         // Without trailing backslash
-        let basedir = b"c:/users/test/project".to_vec();
+        let basedir = super::BasedirEntry::from_normalized(b"c:/users/test/project".to_vec()).unwrap();
         let input = b"# 1 \"C:\\Users\\test\\project\\Src\\Main.c\"";
         let output = super::strip_basedirs(input, std::slice::from_ref(&basedir));
         // normalized backslash to slash
@@ -1637,7 +1775,7 @@ mod tests {
         assert_eq!(&*output, expected);
 
         // Trailing slashes aren't ignored, they must be cleaned in config reader
-        let basedir = b"c:/users/test/project/".to_vec();
+        let basedir = super::BasedirEntry::from_normalized(b"c:/users/test/project/".to_vec()).unwrap();
         let input = b"# 1 \"C:\\Users\\test\\project\\src\\main.c\"";
         let output = super::strip_basedirs(input, std::slice::from_ref(&basedir));
         let expected = b"# 1 \"src\\main.c\"";
@@ -1650,7 +1788,7 @@ mod tests {
         // The slashes may be mixed in preprocessor output, but the uncut output
         // should remain untouched.
         // Mixed forward and backslashes in input (common from certain build systems)
-        let basedir = b"c:/users/test/project/".to_vec();
+        let basedir = super::BasedirEntry::from_normalized(b"c:/users/test/project/".to_vec()).unwrap();
         let input = b"# 1 \"C:/Users\\test\\project\\src/main.c\"";
         let output = super::strip_basedirs(input, std::slice::from_ref(&basedir));
         let expected = b"# 1 \"src/main.c\"";
@@ -1833,5 +1971,102 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(h1, h2);
+    }
+
+    // === BasedirEntry: literal fast-path tests (parity with pre-glob behavior) ===
+
+    #[test]
+    fn test_basedir_literal_match_exact_prefix() {
+        let e = super::BasedirEntry::from_normalized(b"/home/user/project/".to_vec()).unwrap();
+        assert!(e.is_literal());
+        assert_eq!(
+            e.matched_prefix_len(b"/home/user/project/src/main.rs"),
+            Some(b"/home/user/project/".len())
+        );
+    }
+
+    #[test]
+    fn test_basedir_literal_no_match() {
+        let e = super::BasedirEntry::from_normalized(b"/home/user/project/".to_vec()).unwrap();
+        assert_eq!(e.matched_prefix_len(b"/other/path/src/main.rs"), None);
+    }
+
+    // === BasedirEntry: glob tests ===
+
+    #[test]
+    fn test_basedir_glob_detects_metacharacters() {
+        let literal =
+            super::BasedirEntry::from_normalized(b"/home/user/project/".to_vec()).unwrap();
+        assert!(literal.is_literal());
+
+        let star = super::BasedirEntry::from_normalized(b"/home/user/*/project/".to_vec()).unwrap();
+        assert!(!star.is_literal());
+
+        let dstar =
+            super::BasedirEntry::from_normalized(b"/home/user/**/project/".to_vec()).unwrap();
+        assert!(!dstar.is_literal());
+
+        let q = super::BasedirEntry::from_normalized(b"/home/user/proj?/".to_vec()).unwrap();
+        assert!(!q.is_literal());
+
+        let class =
+            super::BasedirEntry::from_normalized(b"/home/user/proj[ab]/".to_vec()).unwrap();
+        assert!(!class.is_literal());
+    }
+
+    #[test]
+    fn test_basedir_glob_single_star_matches_one_component() {
+        let e = super::BasedirEntry::from_normalized(b"/home/user/*/project/".to_vec()).unwrap();
+        let path = b"/home/user/alice/project/src/main.rs";
+        let n = e.matched_prefix_len(path).expect("should match");
+        assert_eq!(&path[n..], b"src/main.rs");
+    }
+
+    #[test]
+    fn test_basedir_glob_double_star_matches_many_components() {
+        let e = super::BasedirEntry::from_normalized(b"/home/**/project/".to_vec()).unwrap();
+        let path = b"/home/user/a/b/c/project/src/main.rs";
+        let n = e.matched_prefix_len(path).expect("should match");
+        assert_eq!(&path[n..], b"src/main.rs");
+    }
+
+    #[test]
+    fn test_basedir_glob_no_match() {
+        let e = super::BasedirEntry::from_normalized(b"/home/*/project/".to_vec()).unwrap();
+        assert_eq!(e.matched_prefix_len(b"/opt/project/src/main.rs"), None);
+    }
+
+    #[test]
+    fn test_basedir_glob_worktree_dedup() {
+        let pat = b"/repos/proj/worktrees/proj/*/proj/".to_vec();
+        let e = super::BasedirEntry::from_normalized(pat).unwrap();
+
+        let p1: &[u8] = b"/repos/proj/worktrees/proj/wt-a/proj/src/main.rs";
+        let p2: &[u8] = b"/repos/proj/worktrees/proj/wt-b/proj/src/main.rs";
+
+        let n1 = e.matched_prefix_len(p1).expect("p1 should match");
+        let n2 = e.matched_prefix_len(p2).expect("p2 should match");
+        assert_eq!(&p1[n1..], b"src/main.rs");
+        assert_eq!(&p2[n2..], b"src/main.rs");
+        assert_eq!(&p1[n1..], &p2[n2..]);
+    }
+
+    #[test]
+    fn test_longest_basedir_match_prefers_longest() {
+        let short = super::BasedirEntry::from_normalized(b"/r/".to_vec()).unwrap();
+        let long =
+            super::BasedirEntry::from_normalized(b"/r/proj/worktrees/proj/*/proj/".to_vec())
+                .unwrap();
+        let entries = vec![short, long];
+        let path: &[u8] = b"/r/proj/worktrees/proj/wt-a/proj/src/main.rs";
+        let n = super::longest_basedir_match(path, &entries).expect("should match");
+        assert_eq!(&path[n..], b"src/main.rs");
+    }
+
+    #[test]
+    fn test_basedir_invalid_glob_rejected() {
+        // `[` without a closing `]` is invalid glob syntax.
+        let err = super::BasedirEntry::from_normalized(b"/home/[unclosed/".to_vec());
+        assert!(err.is_err(), "invalid glob should be rejected");
     }
 }

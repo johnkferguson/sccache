@@ -27,7 +27,7 @@ use crate::dist::pkg;
 use crate::lru_disk_cache::{LruCache, Meter};
 use crate::mock_command::{CommandCreatorSync, RunCommand};
 use crate::util::{Digest, fmt_duration_as_secs, hash_all, hash_all_archives, run_input_output};
-use crate::util::{HashToDigest, OsStrExt};
+use crate::util::{BasedirEntry, HashToDigest, OsStrExt, longest_basedir_match};
 use crate::{counted_array, dist};
 use async_trait::async_trait;
 use filetime::FileTime;
@@ -87,7 +87,10 @@ fn is_cargo_path_var(var: &str) -> bool {
 /// result is a clean relative path. On Windows, the value is normalized
 /// (lowercase + forward slashes) before comparison since basedirs are stored
 /// normalized.
-fn strip_basedir_prefix<'a>(value: &'a [u8], basedirs: &[Vec<u8>]) -> Cow<'a, [u8]> {
+///
+/// When multiple basedirs match the value, the longest matched prefix wins.
+/// Glob basedirs are supported via the same API; see [`BasedirEntry`].
+fn strip_basedir_prefix<'a>(value: &'a [u8], basedirs: &[BasedirEntry]) -> Cow<'a, [u8]> {
     if basedirs.is_empty() {
         return Cow::Borrowed(value);
     }
@@ -97,15 +100,15 @@ fn strip_basedir_prefix<'a>(value: &'a [u8], basedirs: &[Vec<u8>]) -> Cow<'a, [u
     #[cfg(not(target_os = "windows"))]
     let normalized = value;
 
-    for basedir in basedirs {
-        if normalized.starts_with(basedir) {
+    match longest_basedir_match(&normalized, basedirs) {
+        Some(len) => {
             #[cfg(target_os = "windows")]
-            return Cow::Owned(normalized[basedir.len()..].to_vec());
+            return Cow::Owned(normalized[len..].to_vec());
             #[cfg(not(target_os = "windows"))]
-            return Cow::Borrowed(&value[basedir.len()..]);
+            return Cow::Borrowed(&value[len..]);
         }
+        None => Cow::Borrowed(value),
     }
-    Cow::Borrowed(value)
 }
 
 #[cfg(feature = "dist-client")]
@@ -3975,7 +3978,7 @@ proc_macro false
         args: &[&'static str],
         env_vars: &[(OsString, OsString)],
         pre_func: F,
-        basedirs: Vec<Vec<u8>>,
+        basedirs: Vec<BasedirEntry>,
     ) -> String
     where
         F: Fn(&Path) -> Result<()>,
@@ -4064,7 +4067,8 @@ proc_macro false
         let basedir = crate::util::normalize_win_path(&basedir);
         let mut basedir = basedir;
         basedir.push(b'/');
-        let key_with = hash_key_with_basedirs(&f, args, &env_vars, nothing, vec![basedir]);
+        let basedir_entry = BasedirEntry::from_normalized(basedir).unwrap();
+        let key_with = hash_key_with_basedirs(&f, args, &env_vars, nothing, vec![basedir_entry]);
 
         // The keys should differ because basedirs changes the hash
         assert_ne!(key_without, key_with, "basedirs should change the hash key");
@@ -4101,9 +4105,11 @@ proc_macro false
         let basedir = crate::util::normalize_win_path(&basedir);
         let mut basedir = basedir;
         basedir.push(b'/');
+        let basedir_entry = BasedirEntry::from_normalized(basedir).unwrap();
 
-        let key1 = hash_key_with_basedirs(&f, args, &env_vars, nothing, vec![basedir.clone()]);
-        let key2 = hash_key_with_basedirs(&f, args, &env_vars, nothing, vec![basedir]);
+        let key1 =
+            hash_key_with_basedirs(&f, args, &env_vars, nothing, vec![basedir_entry.clone()]);
+        let key2 = hash_key_with_basedirs(&f, args, &env_vars, nothing, vec![basedir_entry]);
 
         assert_eq!(key1, key2, "Same basedir should produce deterministic hash");
     }

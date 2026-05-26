@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::cache::CacheMode;
+use crate::util::BasedirEntry;
 #[cfg(target_os = "windows")]
 use crate::util::normalize_win_path;
 use directories::ProjectDirs;
@@ -1267,7 +1268,7 @@ pub struct Config {
     pub server_startup_timeout: Option<std::time::Duration>,
     /// Base directory (or directories) to strip from paths for cache key computation.
     /// Similar to ccache's CCACHE_BASEDIR.
-    pub basedirs: Vec<Vec<u8>>,
+    pub basedirs: Vec<BasedirEntry>,
 }
 
 impl Config {
@@ -1311,7 +1312,7 @@ impl Config {
 
         // Validate that all basedirs are absolute paths
         // basedirs_raw is Vec<PathBuf>
-        let mut basedirs = Vec::with_capacity(basedirs_raw.len());
+        let mut basedirs: Vec<BasedirEntry> = Vec::with_capacity(basedirs_raw.len());
         for d in basedirs_raw {
             let p = Utf8TypedPathBuf::from(d);
             if !p.is_absolute() {
@@ -1338,16 +1339,20 @@ impl Config {
                     bytes
                 }
             };
-            // push only if not already present
-            if !basedirs.contains(&normalized) {
-                basedirs.push(normalized);
+            let entry = BasedirEntry::from_normalized(normalized)?;
+            // push only if not already present (compare on normalized bytes)
+            if !basedirs
+                .iter()
+                .any(|e| e.normalized_bytes() == entry.normalized_bytes())
+            {
+                basedirs.push(entry);
             }
         }
 
         if !basedirs.is_empty() && log::log_enabled!(log::Level::Debug) {
             let basedirs_str: Vec<String> = basedirs
                 .iter()
-                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .map(|e| String::from_utf8_lossy(e.normalized_bytes()).into_owned())
                 .collect();
             debug!("Using basedirs for path normalization: {:?}", basedirs_str);
         }
@@ -1595,6 +1600,13 @@ pub mod server {
     }
 }
 
+/// Test helper: build a `BasedirEntry` from already-normalized bytes (with the
+/// trailing `/` the config loader would have added). Panics on invalid input.
+#[cfg(test)]
+fn mk_basedir(normalized: &[u8]) -> BasedirEntry {
+    BasedirEntry::from_normalized(normalized.to_vec()).unwrap()
+}
+
 #[test]
 fn test_parse_size() {
     assert_eq!(None, parse_size(""));
@@ -1738,7 +1750,10 @@ fn config_basedirs_overrides() {
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
-    assert_eq!(config.basedirs, vec![b"c:/env/basedir/".to_vec()]);
+    assert_eq!(
+        config.basedirs,
+        vec![mk_basedir(b"c:/env/basedir/")]
+    );
 
     // Test that file config is used when env is None
     let env_conf = EnvConfig {
@@ -1754,7 +1769,10 @@ fn config_basedirs_overrides() {
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
-    assert_eq!(config.basedirs, vec![b"c:/file/basedir/".to_vec()]);
+    assert_eq!(
+        config.basedirs,
+        vec![mk_basedir(b"c:/file/basedir/")]
+    );
 
     // Test that env config is used when env is set but empty
     let env_conf = EnvConfig {
@@ -1806,7 +1824,10 @@ fn config_basedirs_overrides() {
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
-    assert_eq!(config.basedirs, vec![b"/env/basedir/".to_vec()]);
+    assert_eq!(
+        config.basedirs,
+        vec![mk_basedir(b"/env/basedir/")]
+    );
 
     // Test that file config is used when env is None
     let env_conf = EnvConfig {
@@ -1822,7 +1843,10 @@ fn config_basedirs_overrides() {
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
-    assert_eq!(config.basedirs, vec![b"/file/basedir/".to_vec()]);
+    assert_eq!(
+        config.basedirs,
+        vec![mk_basedir(b"/file/basedir/")]
+    );
 
     // Test that env config is used when env is set but empty
     let env_conf = EnvConfig {
@@ -2562,7 +2586,7 @@ fn test_integration_config_normalizes_and_strips() {
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
 
     // Verify config normalized the basedir with trailing slash
-    assert_eq!(config.basedirs, vec![b"/home/user/project/"]);
+    assert_eq!(config.basedirs, vec![mk_basedir(b"/home/user/project/")]);
 
     // Test that strip_basedirs uses the normalized basedir
     let input = b"# 1 \"/home/user/project/src/main.c\"\nint main() { return 0; }";
@@ -2595,7 +2619,7 @@ fn test_integration_normalized_path_with_double_slashes() {
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
 
     // Config should normalize to single slashes with one trailing slash
-    assert_eq!(config.basedirs, vec![b"/home/user/project/"]);
+    assert_eq!(config.basedirs, vec![mk_basedir(b"/home/user/project/")]);
 
     // Verify it works with strip_basedirs
     let input = b"# 1 \"/home/user/project/src/main.c\"";
@@ -2624,7 +2648,7 @@ fn test_integration_windows_path_normalization() {
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
 
     // Should be normalized to lowercase with forward slashes
-    assert_eq!(config.basedirs, vec![b"c:/users/test/project/"]);
+    assert_eq!(config.basedirs, vec![mk_basedir(b"c:/users/test/project/")]);
 
     // Test with mixed case preprocessor output
     let input = b"# 1 \"C:\\Users\\Test\\Project\\src\\main.c\"";
@@ -2714,8 +2738,8 @@ fn test_integration_multiple_basedirs_longest_match() {
 
     // Both should be normalized with trailing slashes
     assert_eq!(config.basedirs.len(), 2);
-    assert_eq!(config.basedirs[0], b"/home/user/");
-    assert_eq!(config.basedirs[1], b"/home/user/project/");
+    assert_eq!(config.basedirs[0].normalized_bytes(), b"/home/user/");
+    assert_eq!(config.basedirs[1].normalized_bytes(), b"/home/user/project/");
 
     // Input matches both, but longest should win
     let input = b"# 1 \"/home/user/project/src/main.c\"";
@@ -2747,7 +2771,7 @@ fn test_integration_paths_with_dots_normalized() {
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
 
     // Should be normalized to remove ./ and ../
-    assert_eq!(config.basedirs[0], b"/home/user/project/");
+    assert_eq!(config.basedirs[0].normalized_bytes(), b"/home/user/project/");
 
     // Verify it works with strip_basedirs
     let input = b"# 1 \"/home/user/project/src/main.c\"";
@@ -2775,7 +2799,7 @@ fn test_integration_windows_mixed_slashes() {
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
-    assert_eq!(config.basedirs[0], b"c:/users/test/project/");
+    assert_eq!(config.basedirs[0].normalized_bytes(), b"c:/users/test/project/");
 
     // Preprocessor output with mixed slashes
     let input = b"# 1 \"C:/Users\\test\\project\\src/main.c\"";
@@ -2807,8 +2831,8 @@ fn test_integration_env_variable_to_strip() {
 
     // Should have two normalized basedirs
     assert_eq!(config.basedirs.len(), 2);
-    assert_eq!(config.basedirs[0], b"/home/user/project/");
-    assert_eq!(config.basedirs[1], b"/tmp/build/");
+    assert_eq!(config.basedirs[0].normalized_bytes(), b"/home/user/project/");
+    assert_eq!(config.basedirs[1].normalized_bytes(), b"/tmp/build/");
 
     // Test stripping with both
     let input1 = b"# 1 \"/home/user/project/src/main.c\"";

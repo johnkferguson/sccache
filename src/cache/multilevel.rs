@@ -48,6 +48,7 @@ use crate::compiler::PreprocessorCacheEntry;
 ))]
 use crate::config::CacheType;
 use crate::config::{Config, PreprocessorCacheModeConfig, WriteErrorPolicy};
+use crate::util::BasedirEntry;
 use crate::errors::*;
 
 /// Increment an atomic stats counter, handling the Option check.
@@ -321,12 +322,12 @@ pub struct MultiLevelStorage {
     /// Lock-free atomic statistics per level
     atomic_stats: Vec<Arc<AtomicLevelStats>>,
     /// Base directories for path normalization, propagated to compiler pipeline
-    basedirs: Vec<Vec<u8>>,
+    basedirs: Vec<BasedirEntry>,
 }
 
 impl MultiLevelStorage {
     /// Collect and deduplicate basedirs from all cache levels.
-    fn collect_basedirs(levels: &[Arc<dyn Storage>]) -> Vec<Vec<u8>> {
+    fn collect_basedirs(levels: &[Arc<dyn Storage>]) -> Vec<BasedirEntry> {
         let mut seen = Vec::new();
         for level in levels {
             for basedir in level.basedirs() {
@@ -858,7 +859,7 @@ impl Storage for MultiLevelStorage {
             .unwrap_or_default()
     }
 
-    fn basedirs(&self) -> &[Vec<u8>] {
+    fn basedirs(&self) -> &[BasedirEntry] {
         &self.basedirs
     }
 

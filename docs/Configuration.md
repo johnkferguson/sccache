@@ -15,14 +15,27 @@ server_startup_timeout_ms = 10000
 # paths when compiling the same source code, such as between
 # parallel checkouts of the same project, Git worktrees, or different
 # users in a shared environment.
-# When multiple matching paths are provided, the longest prefix
-# is used.
+# When multiple matching paths are provided, the longest matched
+# prefix is used.
 #
 # Path matching is case-insensitive on Windows and case-sensitive on other OSes.
 #
+# Entries may be literal absolute paths or glob patterns. Supported glob
+# syntax (per the `glob` crate): `*` matches any sequence of non-`/`
+# characters within a single path component; `**` matches zero or more
+# path components; `?` matches a single character; `[abc]` matches a
+# character class. Glob entries only affect Rust hash keys; C/C++
+# preprocessor-output stripping considers literal entries only.
+#
 # Example:
-#   basedir = ["/home/user/project"] results in the path prefix rewrite:
+#   basedirs = ["/home/user/project"] results in the path prefix rewrite:
 #   "/home/user/project/src/main.c" -> "src/main.c"
+#
+# Glob example (for tools that create per-build sub-directories under a
+# stable parent — e.g. Git worktrees with auto-generated names):
+#   basedirs = ["/repos/proj/worktrees/proj/*/proj"]
+#   "/repos/proj/worktrees/proj/wt-a/proj/src/main.rs" -> "src/main.rs"
+#   "/repos/proj/worktrees/proj/wt-b/proj/src/main.rs" -> "src/main.rs"
 basedirs = ["/home/user/project"]
 # basedirs = ["/home/user/project", "/home/user/workspace"]
 

@@ -1494,7 +1494,7 @@ pub struct HashKeyParams<'a> {
     env_vars: &'a [(OsString, OsString)],
     preprocessor_output: &'a [u8],
     plusplus: bool,
-    basedirs: &'a [Vec<u8>],
+    basedirs: &'a [crate::util::BasedirEntry],
 }
 
 impl<'a> HashKeyParams<'a> {
@@ -1544,7 +1544,7 @@ impl<'a> HashKeyParams<'a> {
     }
 
     /// Sets the base directories for path normalization.
-    pub fn with_basedirs(mut self, basedirs: &'a [Vec<u8>]) -> Self {
+    pub fn with_basedirs(mut self, basedirs: &'a [crate::util::BasedirEntry]) -> Self {
         self.basedirs = basedirs;
         self
     }
@@ -1701,16 +1701,15 @@ mod test {
 
     #[test]
     fn test_hash_key_basedirs() {
+        use crate::util::BasedirEntry;
         let args = ovec!["a", "b", "c"];
         let preprocessed1 = b"# 1 \"/home/user1/project/src/main.c\"\nint main() { return 0; }";
         let preprocessed2 = b"# 1 \"/home/user2/project/src/main.c\"\nint main() { return 0; }";
-        let basedirs = [
-            b"/home/user1/project".to_vec(),
-            b"/home/user2/project".to_vec(),
-        ];
+        let mk = |s: &[u8]| BasedirEntry::from_normalized(s.to_vec()).unwrap();
+        let basedirs = [mk(b"/home/user1/project/"), mk(b"/home/user2/project/")];
 
         // Helper to compute with basedirs
-        let hash_with_basedirs = |output: &[u8], dirs: &[Vec<u8>]| {
+        let hash_with_basedirs = |output: &[u8], dirs: &[BasedirEntry]| {
             HashKeyParams::new("abcd", Language::C, &args, output)
                 .with_basedirs(dirs)
                 .compute()
@@ -1748,15 +1747,10 @@ mod test {
             .compute();
         assert_eq!(h_cpp1, h_cpp2);
 
-        // Test 5: Doesn't work with trailing slash in basedir, they must be normalized in config
-        let basedir_slash = b"/home/user1/project/".to_vec();
-        let h_slash = hash_with_basedirs(preprocessed1, std::slice::from_ref(&basedir_slash));
-        assert_neq!(h1, h_slash);
-
-        // Test 6: Multiple basedirs - longest match wins
+        // Test 5: Multiple basedirs - longest match wins
         let multi_basedirs = vec![
-            b"/home/user1".to_vec(),
-            b"/home/user1/project".to_vec(), // This should match (longest)
+            mk(b"/home/user1/"),
+            mk(b"/home/user1/project/"), // This should match (longest)
         ];
         assert_eq!(h1, hash_with_basedirs(preprocessed1, &multi_basedirs));
     }

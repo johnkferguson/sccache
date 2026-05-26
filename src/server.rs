@@ -1958,7 +1958,7 @@ impl ServerInfo {
             basedirs = storage
                 .basedirs()
                 .iter()
-                .map(|p| String::from_utf8_lossy(p).to_string())
+                .map(|e| String::from_utf8_lossy(e.normalized_bytes()).to_string())
                 .collect();
             multi_level = storage.multilevel_stats();
         } else {
