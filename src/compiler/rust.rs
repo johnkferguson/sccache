@@ -422,6 +422,11 @@ pub struct RustCompilation {
 pub struct CrateTypes {
     rlib: bool,
     staticlib: bool,
+    /// The value of `SCCACHE_RUST_CRATE_TYPE_ALLOW_HASH` when the crate is linked
+    /// (a bin, dylib, cdylib or proc-macro), which only that variable allows.
+    /// It goes into the hash key, so machines with different linker setups can
+    /// set different values and key apart.
+    linked: Option<String>,
 }
 
 /// Emit types that we will cache.
@@ -1424,6 +1429,20 @@ impl Iterator for ExpandResponseFile<'_> {
 }
 
 fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<ParsedArguments> {
+    parse_arguments_with_allow_hash(
+        arguments,
+        cwd,
+        std::env::var("SCCACHE_RUST_CRATE_TYPE_ALLOW_HASH").ok(),
+    )
+}
+
+/// [`parse_arguments`], given the value of `SCCACHE_RUST_CRATE_TYPE_ALLOW_HASH`
+/// rather than reading it from the server's environment.
+fn parse_arguments_with_allow_hash(
+    arguments: &[OsString],
+    cwd: &Path,
+    allow_hash: Option<String>,
+) -> CompilerArguments<ParsedArguments> {
     let mut args = vec![];
 
     let mut emit: Option<HashSet<String>> = None;
@@ -1433,6 +1452,7 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
     let mut crate_types = CrateTypes {
         rlib: false,
         staticlib: false,
+        linked: None,
     };
     let mut extra_filename = None;
     let mut externs = vec![];
@@ -1486,12 +1506,16 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
                 others,
             })) => {
                 // We can't cache non-rlib/staticlib crates, because rustc invokes the
-                // system linker to link them, and we don't know about all the linker inputs.
+                // system linker to link them, and we don't know about all the linker inputs,
+                // unless SCCACHE_RUST_CRATE_TYPE_ALLOW_HASH vouches for them.
                 if !others.is_empty() {
-                    let mut others: Vec<&str> = others.iter().map(String::as_str).collect();
-                    others.sort_unstable();
-                    let others_string = others.join(",");
-                    cannot_cache!("crate-type", others_string)
+                    if allow_hash.is_none() {
+                        let mut others: Vec<&str> = others.iter().map(String::as_str).collect();
+                        others.sort_unstable();
+                        let others_string = others.join(",");
+                        cannot_cache!("crate-type", others_string)
+                    }
+                    crate_types.linked = allow_hash.clone();
                 }
                 crate_types.rlib |= rlib;
                 crate_types.staticlib |= staticlib;
@@ -1597,12 +1621,11 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
     // If it's not an rlib and not a staticlib then crate-type wasn't passed,
     // so it will usually be inferred as a binary, though the `#![crate_type`
     // annotation may dictate otherwise - either way, we don't know what to do.
-    if let CrateTypes {
-        rlib: false,
-        staticlib: false,
-    } = crate_types
-    {
-        cannot_cache!("crate-type", NO_CRATE_TYPE_PASSED.to_owned())
+    if !crate_types.rlib && !crate_types.staticlib {
+        if allow_hash.is_none() {
+            cannot_cache!("crate-type", NO_CRATE_TYPE_PASSED.to_owned())
+        }
+        crate_types.linked = allow_hash;
     }
     // We won't cache invocations that are outputting anything but
     // linker output and dep-info.
@@ -1944,6 +1967,11 @@ where
             .hash(&mut HashToDigest { digest: &mut m });
         // 10. The version of the compiler.
         self.version.hash(&mut HashToDigest { digest: &mut m });
+        // 11. SCCACHE_RUST_CRATE_TYPE_ALLOW_HASH, if this crate is linked.
+        if let Some(linked) = &self.parsed_args.crate_types.linked {
+            m.update(b"SCCACHE_RUST_CRATE_TYPE_ALLOW_HASH=");
+            m.update(linked.as_bytes());
+        }
 
         // metadata / dep-info don't ever generate binaries, but
         // rustc still makes them appear in the --print
@@ -2651,13 +2679,8 @@ impl pkg::InputsPackager for RustInputsPackager {
 
         // If we're just creating an rlib then the only thing inspected inside dependency rlibs is the
         // metadata, in which case we can create a trimmed rlib (which is actually a .a) with the metadata
-        let can_trim_rlibs = matches!(
-            crate_types,
-            CrateTypes {
-                rlib: true,
-                staticlib: false,
-            }
-        );
+        let can_trim_rlibs =
+            crate_types.rlib && !crate_types.staticlib && crate_types.linked.is_none();
 
         let mut builder = tar::Builder::new(wtr);
 
@@ -3096,9 +3119,11 @@ mod test {
         assert_ne!(first, second);
     }
 
+    // Tests don't read SCCACHE_RUST_CRATE_TYPE_ALLOW_HASH from the environment
+    // they happen to run in.
     fn _parse_arguments(arguments: &[String]) -> CompilerArguments<ParsedArguments> {
         let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
-        parse_arguments(&arguments, ".".as_ref())
+        parse_arguments_with_allow_hash(&arguments, ".".as_ref(), None)
     }
 
     macro_rules! parses {
@@ -3474,6 +3499,89 @@ LLVM version: 15.0.2
             "--crate-name",
             "foo"
         );
+    }
+
+    #[test]
+    fn test_parse_arguments_crate_type_allow_hash() {
+        let parse = |crate_type: Option<&str>, allow_hash: Option<&str>| {
+            let mut args: Vec<OsString> = [
+                "--emit",
+                "link",
+                "foo.rs",
+                "--out-dir",
+                "out",
+                "--crate-name",
+                "foo",
+            ]
+            .map(OsString::from)
+            .to_vec();
+            if let Some(crate_type) = crate_type {
+                args.extend(["--crate-type".into(), crate_type.into()]);
+            }
+            parse_arguments_with_allow_hash(&args, ".".as_ref(), allow_hash.map(str::to_owned))
+        };
+
+        // Linked crates, and a crate with no --crate-type, which rustc
+        // usually builds as a bin.
+        for crate_type in [
+            Some("bin"),
+            Some("proc-macro"),
+            Some("cdylib"),
+            Some("rlib,dylib"),
+            None,
+        ] {
+            assert!(
+                matches!(
+                    parse(crate_type, None),
+                    CompilerArguments::CannotCache("crate-type", _)
+                ),
+                "{crate_type:?}"
+            );
+            match parse(crate_type, Some("x86_64-linux-mold")) {
+                CompilerArguments::Ok(a) => {
+                    assert_eq!(a.crate_types.linked.as_deref(), Some("x86_64-linux-mold"));
+                }
+                o => panic!("{crate_type:?}: got unexpected parse result: {o:?}"),
+            }
+        }
+
+        // An rlib isn't linked, so the variable leaves it alone.
+        match parse(Some("rlib"), Some("x86_64-linux-mold")) {
+            CompilerArguments::Ok(a) => assert_eq!(a.crate_types.linked, None),
+            o => panic!("Got unexpected parse result: {o:?}"),
+        }
+    }
+
+    #[test]
+    fn test_hash_crate_type_allow_hash() {
+        let f = TestFixture::new();
+        let key = |crate_type: &str, allow_hash: Option<&str>| {
+            hash_key_with_allow_hash(
+                &f,
+                &[
+                    "--emit",
+                    "link",
+                    "foo.rs",
+                    "--out-dir",
+                    "out",
+                    "--crate-name",
+                    "foo",
+                    "--crate-type",
+                    crate_type,
+                ],
+                &[],
+                &[],
+                nothing,
+                MockStorage::new(None, false),
+                allow_hash,
+            )
+        };
+        // A linked crate is keyed by the variable's value.
+        assert_ne!(key("bin", Some("linker-a")), key("bin", Some("linker-b")));
+        assert_eq!(key("bin", Some("linker-a")), key("bin", Some("linker-a")));
+        // An rlib is keyed the same whatever the value, or without it.
+        assert_eq!(key("lib", None), key("lib", Some("linker-a")));
+        assert_eq!(key("lib", Some("linker-a")), key("lib", Some("linker-b")));
     }
 
     #[test]
@@ -4095,6 +4203,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 crate_types: CrateTypes {
                     rlib: true,
                     staticlib: false,
+                    linked: None,
                 },
                 dep_info: None,
                 emit,
@@ -4201,6 +4310,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 crate_types: CrateTypes {
                     rlib: true,
                     staticlib: false,
+                    linked: None,
                 },
                 dep_info: Some("foo-abc.d".into()),
                 emit,
@@ -4285,11 +4395,31 @@ foo.rs:
         A: AsRef<OsStr>,
         F: Fn(&Path) -> Result<()>,
     {
+        hash_key_with_allow_hash(f, args, env_vars, env_deps, pre_func, storage, None)
+    }
+
+    fn hash_key_with_allow_hash<A, F>(
+        f: &TestFixture,
+        args: &[A],
+        env_vars: &[(OsString, OsString)],
+        env_deps: &[(&str, OsString)],
+        pre_func: F,
+        storage: MockStorage,
+        allow_hash: Option<&str>,
+    ) -> String
+    where
+        A: AsRef<OsStr>,
+        F: Fn(&Path) -> Result<()>,
+    {
         let oargs = args
             .iter()
             .map(|a| a.as_ref().to_owned())
             .collect::<Vec<OsString>>();
-        let parsed_args = match parse_arguments(&oargs, f.tempdir.path()) {
+        let parsed_args = match parse_arguments_with_allow_hash(
+            &oargs,
+            f.tempdir.path(),
+            allow_hash.map(str::to_owned),
+        ) {
             CompilerArguments::Ok(parsed_args) => parsed_args,
             o => panic!("Got unexpected parse result: {:?}", o),
         };

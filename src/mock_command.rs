@@ -54,7 +54,7 @@ use std::fmt;
 use std::io;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Output, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
 
@@ -186,6 +186,20 @@ impl CommandChild for Child {
     }
 }
 
+/// Held for writing while a process is spawned, and for reading while a cache
+/// hit's output is open for writing. A child inherits every descriptor open at
+/// fork time until it execs, and while it holds an executable open for writing,
+/// cargo running that executable fails with ETXTBSY.
+static SPAWN_LOCK: RwLock<()> = RwLock::new(());
+
+/// Keep processes from being spawned while the guard lives, if the outputs
+/// being written can be executables: only build scripts and other bins cached
+/// under `SCCACHE_RUST_CRATE_TYPE_ALLOW_HASH` are.
+pub(crate) fn hold_off_spawns() -> Option<RwLockReadGuard<'static, ()>> {
+    std::env::var_os("SCCACHE_RUST_CRATE_TYPE_ALLOW_HASH")
+        .map(|_| SPAWN_LOCK.read().unwrap_or_else(PoisonError::into_inner))
+}
+
 pub struct AsyncCommand {
     inner: Option<Command>,
     jobserver: Client,
@@ -281,10 +295,11 @@ impl RunCommand for AsyncCommand {
         // tokens of its own.
         let token = self.jobserver.acquire().await?;
         let mut inner = tokio::process::Command::from(inner);
-        let child = inner
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("failed to spawn {:?}", inner))?;
+        let child = {
+            let _spawn_guard = SPAWN_LOCK.write().unwrap_or_else(PoisonError::into_inner);
+            inner.kill_on_drop(true).spawn()
+        }
+        .with_context(|| format!("failed to spawn {:?}", inner))?;
 
         Ok(Child {
             inner: child,

@@ -43,6 +43,48 @@ fn test_rust_cargo_build_readonly() -> Result<()> {
     test_rust_cargo_cmd_readonly("build", SccacheTest::new(None)?)
 }
 
+/// With SCCACHE_RUST_CRATE_TYPE_ALLOW_HASH in the server's environment the bin
+/// is cached along with the libraries, and the binary restored from the cache
+/// runs.
+#[test]
+#[serial]
+fn test_rust_cargo_build_crate_type_allow_hash() -> Result<()> {
+    let test_info = SccacheTest::new(None)?;
+    restart_sccache(
+        &test_info,
+        Some(vec![(
+            "SCCACHE_RUST_CRATE_TYPE_ALLOW_HASH".into(),
+            "test".into(),
+        )]),
+    )?;
+    for _ in 0..2 {
+        cargo_clean(&test_info)?;
+        Command::new(CARGO.as_os_str())
+            .args(["build", "--color=never"])
+            .envs(test_info.env.iter().cloned())
+            .current_dir(CRATE_DIR.as_os_str())
+            .assert()
+            .try_success()?;
+    }
+    test_info
+        .show_stats()?
+        .try_stdout(
+            predicates::str::contains(
+                r#""cache_hits":{"counts":{"Rust":3},"adv_counts":{"rust":3}}"#,
+            )
+            .from_utf8(),
+        )?
+        .try_success()?;
+    Command::new(CARGO.as_os_str())
+        .args(["run", "--color=never"])
+        .envs(test_info.env.iter().cloned())
+        .current_dir(CRATE_DIR.as_os_str())
+        .assert()
+        .try_stderr(predicates::str::contains("Compiling").not())?
+        .try_success()?;
+    Ok(())
+}
+
 #[test]
 #[serial]
 #[cfg(unix)]

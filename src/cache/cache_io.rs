@@ -166,6 +166,7 @@ impl CacheRead {
                     Some(d) => d,
                     None => bail!("Output file without a parent directory!"),
                 };
+                let _spawn_guard = crate::mock_command::hold_off_spawns();
                 // Write the cache entry to a tempfile and then atomically
                 // move it to its final location so that other rustc invocations
                 // happening in parallel don't see a partially-written file.
