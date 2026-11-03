@@ -1404,6 +1404,9 @@ impl Config {
                     bytes
                 }
             };
+            if crate::util::is_glob_basedir(&normalized) {
+                crate::util::compile_basedir_glob(&normalized)?;
+            }
             // push only if not already present
             if !basedirs.contains(&normalized) {
                 basedirs.push(normalized);
@@ -3374,6 +3377,55 @@ fn test_integration_multiple_basedirs_longest_match() {
     // Should match the longest basedir (/home/user/project/)
     let expected = b"# 1 \"src/main.c\"";
     assert_eq!(&*output, expected);
+}
+
+#[test]
+#[cfg(not(target_os = "windows"))]
+fn test_integration_glob_basedirs() {
+    use crate::util::strip_basedirs_from_arg;
+
+    let config = |basedirs: &[&str]| {
+        let env_conf = EnvConfig {
+            cache: Default::default(),
+            basedirs: Some(basedirs.iter().map(|b| b.to_string()).collect()),
+            dist_cache_dir: None,
+            client_side_mode: None,
+        };
+        Config::from_env_and_file_configs(env_conf, Default::default())
+    };
+
+    // Normalized like a literal basedir, pattern characters kept.
+    let config = config(&["/home/user/repos/*/*", "/home/user//worktrees/*/[ab]?/"]).unwrap();
+    assert_eq!(
+        config.basedirs,
+        vec![
+            b"/home/user/repos/*/*/".to_vec(),
+            b"/home/user/worktrees/*/[ab]?/".to_vec()
+        ]
+    );
+    assert_eq!(
+        &*strip_basedirs_from_arg(b"/home/user/repos/org/proj/src/lib.rs", &config.basedirs),
+        b"src/lib.rs"
+    );
+    assert_eq!(
+        &*strip_basedirs_from_arg(b"/home/user/worktrees/x/b1/src/lib.rs", &config.basedirs),
+        b"src/lib.rs"
+    );
+}
+
+#[test]
+fn test_invalid_glob_basedir_is_rejected() {
+    let env_conf = EnvConfig {
+        cache: Default::default(),
+        basedirs: Some(vec!["/home/user/[unclosed".to_string()]),
+        dist_cache_dir: None,
+        client_side_mode: None,
+    };
+    let err = Config::from_env_and_file_configs(env_conf, Default::default()).unwrap_err();
+    assert!(
+        err.to_string().contains("Invalid basedir glob pattern"),
+        "{err}"
+    );
 }
 
 #[test]

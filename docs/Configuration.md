@@ -30,9 +30,19 @@ server_startup_timeout_ms = 10000
 # For Rust, also applies to the working directory, the CARGO_*
 # variables and the variables read with env!, such as OUT_DIR.
 #
+# An entry containing `*`, `?` or `[` is a glob pattern, for checkouts
+# whose names can't be listed ahead of time, such as auto-named Git
+# worktrees. `*`, `?` and `[...]` match within one path component and
+# `**` matches any number of them. A glob matches whole directories,
+# and the longest match among all entries is stripped.
+#
 # Example:
 #   basedir = ["/home/user/project"] results in the path prefix rewrite:
 #   "/home/user/project/src/main.c" -> "src/main.c"
+#
+#   basedirs = ["/home/user/worktrees/*/project"] results in:
+#   "/home/user/worktrees/wt-a/project/src/main.rs" -> "src/main.rs"
+#   "/home/user/worktrees/wt-b/project/src/main.rs" -> "src/main.rs"
 basedirs = ["/home/user/project"]
 # basedirs = ["/home/user/project", "/home/user/workspace"]
 
@@ -191,7 +201,7 @@ Note that some env variables may need sccache server restart to take effect.
 
 * `SCCACHE_ALLOW_CORE_DUMPS` to enable core dumps by the server
 * `SCCACHE_CONF` configuration file path
-* `SCCACHE_BASEDIRS` base directory (or directories) to strip from paths for cache key computation. This is similar to ccache's `CCACHE_BASEDIR` and enables cache hits across different absolute paths when compiling the same source code. Multiple directories can be separated by `;` on Windows hosts and by `:` on any other operating system. When multiple directories are specified, the longest matching prefix is used. Path matching is **case-insensitive** on Windows and **case-sensitive** on other operating systems. Environment variable takes precedence over file configuration. Only absolute paths are supported; relative paths will cause an error and prevent the server from start.
+* `SCCACHE_BASEDIRS` base directory (or directories) to strip from paths for cache key computation. This is similar to ccache's `CCACHE_BASEDIR` and enables cache hits across different absolute paths when compiling the same source code. Multiple directories can be separated by `;` on Windows hosts and by `:` on any other operating system. When multiple directories are specified, the longest matching prefix is used. Path matching is **case-insensitive** on Windows and **case-sensitive** on other operating systems. Environment variable takes precedence over file configuration. Only absolute paths are supported; relative paths will cause an error and prevent the server from start. Entries containing `*`, `?` or `[` are glob patterns, see the `basedirs` file option above.
 * `SCCACHE_CACHED_CONF`
 * `SCCACHE_DIST_CLIENT_CACHE_DIR` distributed toolchain cache directory; overrides `[dist].cache_dir` from the configuration file.
 * `SCCACHE_IDLE_TIMEOUT` how long the local daemon process waits for more client requests before exiting, in seconds. Set to `0` to run sccache permanently

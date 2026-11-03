@@ -4401,6 +4401,56 @@ foo.rs:
         assert_eq!(key(&a, "x", vec![]), key(&a, "x", vec![elsewhere]));
     }
 
+    /// The same crate in two checkouts, keyed alike under one glob basedir that
+    /// matches both roots.
+    #[test]
+    fn test_equal_hashes_glob_basedirs() {
+        fn key(f: &TestFixture, basedirs: Vec<Vec<u8>>) -> String {
+            let root = f.tempdir.path();
+            hash_key_with(
+                f,
+                &[
+                    OsString::from("--emit"),
+                    "link".into(),
+                    "foo.rs".into(),
+                    "--out-dir".into(),
+                    "out".into(),
+                    "--crate-name".into(),
+                    "foo".into(),
+                    "--crate-type".into(),
+                    "lib".into(),
+                    format!("--remap-path-prefix={}=/src", root.display()).into(),
+                    "-L".into(),
+                    root.join("target").join("deps").into(),
+                ],
+                &[
+                    ("CARGO_MANIFEST_DIR".into(), root.into()),
+                    (
+                        "CARGO_INSTALL_ROOT".into(),
+                        root.join(".devenv").join("state").into(),
+                    ),
+                ],
+                &[("OUT_DIR", root.join("target").join("out").into())],
+                nothing,
+                MockStorage::new(None, false).with_basedirs(basedirs),
+            )
+        }
+
+        let a = TestFixture::new();
+        let b = TestFixture::new();
+        // TestFixture roots are `sccache_test*` directories in the temp dir.
+        let parent = a.tempdir.path().parent().unwrap();
+        assert_eq!(parent, b.tempdir.path().parent().unwrap());
+        let mut glob = basedir(parent);
+        glob.extend_from_slice(b"sccache_test*/");
+        assert_ne!(key(&a, vec![]), key(&b, vec![]));
+        assert_eq!(key(&a, vec![glob.clone()]), key(&b, vec![glob]));
+        // A glob that matches neither root leaves the keys apart.
+        let mut glob = basedir(parent);
+        glob.extend_from_slice(b"sccache_elsewhere*/");
+        assert_ne!(key(&a, vec![glob.clone()]), key(&b, vec![glob]));
+    }
+
     /// An env-dep equal to a basedir is keyed apart from an unset one, which rustc
     /// writes as `# env-dep:Y` for an `option_env!("Y")`.
     #[test]

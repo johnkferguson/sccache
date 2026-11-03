@@ -343,6 +343,14 @@ export SCCACHE_BASEDIRS="/home/user/project:/home/user/workspace"
 
 Path matching is **case-insensitive** on Windows and **case-sensitive** on other operating systems.
 
+An entry containing `*`, `?` or `[` is a glob pattern, for checkouts whose names can't be listed ahead of time, such as auto-named Git worktrees:
+
+```bash
+export SCCACHE_BASEDIRS="/home/user/repos/*/*:/home/user/worktrees/*/project"
+```
+
+`*`, `?` and `[...]` match within one path component, and `**` matches any number of components. A glob matches whole directories: `/home/user/repos/*/*` strips `/home/user/repos/org/project/` from `/home/user/repos/org/project/src/lib.rs`, not more. As with literal entries, the longest match wins. In preprocessed C and C++ source, glob entries are only matched against paths that start with `/`.
+
 Base directories are stripped from the preprocessed source and from the compiler arguments alike. The arguments matter because a flag can name the tree it is building: `-ffile-prefix-map=/home/user/project=.` makes the object file independent of where the tree is checked out, but the flag itself is not, and it is hashed verbatim.
 
 In an argument only the places that are expected to spell a pathname are considered: the whole argument, the value of an option written with an `=` (either half of a prefix map), and the value glued to a short option such as `-I`. A base directory appearing anywhere else is left alone, so a definition the compiler bakes into the output verbatim, `-DROOT="/home/user/project"`, still counts. A match also has to end where a path component ends, so a sibling `/home/user/project-docs` is not one.
