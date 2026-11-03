@@ -842,9 +842,13 @@ where
         &self,
         arguments: &[OsString],
         cwd: &Path,
-        _env_vars: &[(OsString, OsString)],
+        env_vars: &[(OsString, OsString)],
     ) -> CompilerArguments<Box<dyn CompilerHasher<T> + 'static>> {
-        match parse_arguments(arguments, cwd) {
+        let allow_hash = env_vars
+            .iter()
+            .find(|(k, _)| k == "SCCACHE_RUST_CRATE_TYPE_ALLOW_HASH")
+            .map(|(_, v)| v.to_string_lossy().into_owned());
+        match parse_arguments(arguments, cwd, allow_hash) {
             CompilerArguments::Ok(args) => CompilerArguments::Ok(Box::new(RustHasher {
                 executable: self.executable.clone(), // if rustup exists, this must already contain the true resolved compiler path
                 host: self.host.clone(),
@@ -1428,17 +1432,9 @@ impl Iterator for ExpandResponseFile<'_> {
     }
 }
 
-fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<ParsedArguments> {
-    parse_arguments_with_allow_hash(
-        arguments,
-        cwd,
-        std::env::var("SCCACHE_RUST_CRATE_TYPE_ALLOW_HASH").ok(),
-    )
-}
-
-/// [`parse_arguments`], given the value of `SCCACHE_RUST_CRATE_TYPE_ALLOW_HASH`
-/// rather than reading it from the server's environment.
-fn parse_arguments_with_allow_hash(
+/// `allow_hash` is the value of `SCCACHE_RUST_CRATE_TYPE_ALLOW_HASH` in the
+/// compilation's environment.
+fn parse_arguments(
     arguments: &[OsString],
     cwd: &Path,
     allow_hash: Option<String>,
@@ -1626,6 +1622,11 @@ fn parse_arguments_with_allow_hash(
             cannot_cache!("crate-type", NO_CRATE_TYPE_PASSED.to_owned())
         }
         crate_types.linked = allow_hash;
+    }
+    // `--print file-names` names a linked crate's binary, not the .rmeta that
+    // `--emit=metadata` writes instead, so a hit couldn't restore it.
+    if crate_types.linked.is_some() && !emit.contains("link") {
+        cannot_cache!("crate-type", "linked crate without --emit=link".to_owned())
     }
     // We won't cache invocations that are outputting anything but
     // linker output and dep-info.
@@ -2191,6 +2192,10 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
         let dist_command = None;
         #[cfg(feature = "dist-client")]
         let dist_command = (|| {
+            // Linking needs the local linker and system libraries.
+            if self.crate_types.linked.is_some() {
+                return None;
+            }
             macro_rules! try_string_arg {
                 ($e:expr) => {
                     match $e {
@@ -3123,7 +3128,7 @@ mod test {
     // they happen to run in.
     fn _parse_arguments(arguments: &[String]) -> CompilerArguments<ParsedArguments> {
         let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
-        parse_arguments_with_allow_hash(&arguments, ".".as_ref(), None)
+        parse_arguments(&arguments, ".".as_ref(), None)
     }
 
     macro_rules! parses {
@@ -3518,7 +3523,7 @@ LLVM version: 15.0.2
             if let Some(crate_type) = crate_type {
                 args.extend(["--crate-type".into(), crate_type.into()]);
             }
-            parse_arguments_with_allow_hash(&args, ".".as_ref(), allow_hash.map(str::to_owned))
+            parse_arguments(&args, ".".as_ref(), allow_hash.map(str::to_owned))
         };
 
         // Linked crates, and a crate with no --crate-type, which rustc
@@ -3550,6 +3555,25 @@ LLVM version: 15.0.2
             CompilerArguments::Ok(a) => assert_eq!(a.crate_types.linked, None),
             o => panic!("Got unexpected parse result: {o:?}"),
         }
+
+        // `cargo check` of a linked crate writes an .rmeta that can't be restored.
+        let args: Vec<OsString> = [
+            "--emit",
+            "dep-info,metadata",
+            "foo.rs",
+            "--out-dir",
+            "out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "bin",
+        ]
+        .map(OsString::from)
+        .to_vec();
+        assert!(matches!(
+            parse_arguments(&args, ".".as_ref(), Some("x86_64-linux-mold".to_owned())),
+            CompilerArguments::CannotCache("crate-type", _)
+        ));
     }
 
     #[test]
@@ -4415,14 +4439,11 @@ foo.rs:
             .iter()
             .map(|a| a.as_ref().to_owned())
             .collect::<Vec<OsString>>();
-        let parsed_args = match parse_arguments_with_allow_hash(
-            &oargs,
-            f.tempdir.path(),
-            allow_hash.map(str::to_owned),
-        ) {
-            CompilerArguments::Ok(parsed_args) => parsed_args,
-            o => panic!("Got unexpected parse result: {:?}", o),
-        };
+        let parsed_args =
+            match parse_arguments(&oargs, f.tempdir.path(), allow_hash.map(str::to_owned)) {
+                CompilerArguments::Ok(parsed_args) => parsed_args,
+                o => panic!("Got unexpected parse result: {:?}", o),
+            };
         // Just use empty files for sources.
         {
             let src = &"foo.rs";
@@ -5013,7 +5034,7 @@ foo.rs:
             .unwrap();
         let arg = format!("@{}", td.path().join("args").display());
         let args: Vec<OsString> = vec![OsString::from(arg)];
-        let result = parse_arguments(&args, td.path());
+        let result = parse_arguments(&args, td.path(), None);
         let parsed = match result {
             CompilerArguments::Ok(args) => args,
             o => panic!("Got unexpected parse result: {:?}", o),
@@ -5030,7 +5051,7 @@ foo.rs:
         // to missing --out-dir / --emit etc.
         let cwd = Path::new("/nonexistent");
         let args: Vec<OsString> = vec![OsString::from("@missing_file")];
-        let result = parse_arguments(&args, cwd);
+        let result = parse_arguments(&args, cwd, None);
         assert!(matches!(result, CompilerArguments::CannotCache(..)));
     }
 

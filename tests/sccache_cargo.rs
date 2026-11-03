@@ -43,20 +43,15 @@ fn test_rust_cargo_build_readonly() -> Result<()> {
     test_rust_cargo_cmd_readonly("build", SccacheTest::new(None)?)
 }
 
-/// With SCCACHE_RUST_CRATE_TYPE_ALLOW_HASH in the server's environment the bin
-/// is cached along with the libraries, and the binary restored from the cache
-/// runs.
+/// With SCCACHE_RUST_CRATE_TYPE_ALLOW_HASH in the build environment the bin is
+/// cached along with the libraries, and the binary restored from the cache runs.
 #[test]
 #[serial]
 fn test_rust_cargo_build_crate_type_allow_hash() -> Result<()> {
-    let test_info = SccacheTest::new(None)?;
-    restart_sccache(
-        &test_info,
-        Some(vec![(
-            "SCCACHE_RUST_CRATE_TYPE_ALLOW_HASH".into(),
-            "test".into(),
-        )]),
-    )?;
+    let test_info = SccacheTest::new(Some(&[(
+        "SCCACHE_RUST_CRATE_TYPE_ALLOW_HASH",
+        "test".into(),
+    )]))?;
     for _ in 0..2 {
         cargo_clean(&test_info)?;
         Command::new(CARGO.as_os_str())

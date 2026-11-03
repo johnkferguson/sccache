@@ -192,11 +192,11 @@ impl CommandChild for Child {
 /// cargo running that executable fails with ETXTBSY.
 static SPAWN_LOCK: RwLock<()> = RwLock::new(());
 
-/// Keep processes from being spawned while the guard lives, if the outputs
-/// being written can be executables: only build scripts and other bins cached
-/// under `SCCACHE_RUST_CRATE_TYPE_ALLOW_HASH` are.
-pub(crate) fn hold_off_spawns() -> Option<RwLockReadGuard<'static, ()>> {
-    std::env::var_os("SCCACHE_RUST_CRATE_TYPE_ALLOW_HASH")
+/// Keep processes from being spawned while the guard lives, if the file about
+/// to be written has `mode` and is executable. Cargo runs a build script
+/// restored from the cache right away.
+pub(crate) fn hold_off_spawns(mode: Option<u32>) -> Option<RwLockReadGuard<'static, ()>> {
+    mode.filter(|mode| mode & 0o111 != 0)
         .map(|_| SPAWN_LOCK.read().unwrap_or_else(PoisonError::into_inner))
 }
 
@@ -632,6 +632,15 @@ mod test {
         })
         .join()
         .unwrap()
+    }
+
+    #[test]
+    fn test_hold_off_spawns_only_for_executables() {
+        assert!(super::hold_off_spawns(None).is_none());
+        assert!(super::hold_off_spawns(Some(0o644)).is_none());
+        let guard = super::hold_off_spawns(Some(0o755));
+        assert!(guard.is_some());
+        assert!(super::SPAWN_LOCK.try_write().is_err());
     }
 
     #[test]
