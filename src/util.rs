@@ -21,12 +21,14 @@ use object::read::archive::ArchiveFile;
 use object::read::macho::{FatArch, MachOFatFile32, MachOFatFile64};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::hash::Hasher;
 use std::io::prelude::*;
 use std::path::{Path, PathBuf};
 use std::process::{self, Stdio};
+use std::rc::Rc;
 use std::str;
 use std::time::Duration;
 use std::time::{self, SystemTime};
@@ -1249,46 +1251,73 @@ pub fn compile_basedir_glob(basedir: &[u8]) -> Result<glob::Pattern> {
         .with_context(|| format!("Invalid basedir glob pattern: {s:?}"))
 }
 
-/// The glob basedirs among `basedirs`, compiled, with their index. Config
-/// rejects invalid patterns, so one that fails here is left to match literally.
-fn compile_basedir_globs(basedirs: &[Vec<u8>]) -> Vec<(usize, glob::Pattern)> {
-    basedirs
-        .iter()
-        .enumerate()
-        .filter(|(_, b)| is_glob_basedir(b))
-        .filter_map(|(i, b)| compile_basedir_glob(b).ok().map(|p| (i, p)))
-        .collect()
+/// Each basedir's compiled pattern if it is a glob, or an empty list if none
+/// is. Config rejects invalid patterns, so one that fails here is left to match
+/// literally.
+///
+/// The same few basedirs are matched against every argument of every
+/// compilation, so the patterns are compiled once per thread.
+fn compile_basedir_globs(basedirs: &[Vec<u8>]) -> Vec<Option<Rc<glob::Pattern>>> {
+    thread_local! {
+        static PATTERNS: RefCell<HashMap<Vec<u8>, Option<Rc<glob::Pattern>>>> =
+            RefCell::default();
+    }
+    if !basedirs.iter().any(|b| is_glob_basedir(b)) {
+        return vec![];
+    }
+    PATTERNS.with_borrow_mut(|patterns| {
+        basedirs
+            .iter()
+            .map(|b| {
+                if !is_glob_basedir(b) {
+                    return None;
+                }
+                if let Some(pattern) = patterns.get(b) {
+                    return pattern.clone();
+                }
+                let pattern = compile_basedir_glob(b).ok().map(Rc::new);
+                patterns.insert(b.clone(), pattern.clone());
+                pattern
+            })
+            .collect()
+    })
 }
 
-/// The length of the longest prefix of `path` that a glob basedir matches,
+/// The length of the shortest prefix of `path` that a glob basedir matches,
 /// with the `/` that ends it, or 0. With `bare`, the prefix may also be all of
 /// `path`, a directory named without a trailing slash.
 ///
 /// `*`, `?` and `[...]` stay within one path component and `**` spans any
-/// number of them, as in a shell, so a pattern names a fixed depth of
-/// directories and never swallows the path below it.
+/// number of them, as in a shell. Taking the shortest match makes `**` stop at
+/// the first directory that fits, so `/w/**/proj` strips `/w/a/proj/` from
+/// `/w/a/proj/crates/proj/src/lib.rs`, not the nested `proj`.
 fn glob_basedir_match_len(pattern: &glob::Pattern, path: &[u8], bare: bool) -> usize {
     const OPTIONS: glob::MatchOptions = glob::MatchOptions {
         case_sensitive: true,
         require_literal_separator: true,
         require_literal_leading_dot: false,
     };
-    let path = match std::str::from_utf8(path) {
-        Ok(path) => path,
-        // Everything up to the first invalid byte is a valid prefix.
-        Err(e) => std::str::from_utf8(&path[..e.valid_up_to()]).unwrap_or_default(),
+    let (path, whole) = match std::str::from_utf8(path) {
+        Ok(path) => (path, true),
+        // Everything up to the first invalid byte is a valid prefix, but it
+        // doesn't end where the path does.
+        Err(e) => (
+            std::str::from_utf8(&path[..e.valid_up_to()]).unwrap_or_default(),
+            false,
+        ),
     };
-    let ends = path
-        .match_indices('/')
+    // `*` would match the empty component in `a//b`. A literal basedir doesn't
+    // match across one, and neither does a glob.
+    let path = match path.find("//") {
+        Some(i) => &path[..=i],
+        None => path,
+    };
+    let bare = bare && whole && !path.ends_with('/');
+    path.match_indices('/')
         .map(|(i, _)| (i, i + 1))
-        .chain((bare && !path.ends_with('/')).then_some((path.len(), path.len())));
-    let mut best = 0;
-    for (end, len) in ends {
-        if end > 0 && len > best && pattern.matches_with(&path[..end], OPTIONS) {
-            best = len;
-        }
-    }
-    best
+        .chain(bare.then_some((path.len(), path.len())))
+        .find(|&(end, _)| end > 0 && pattern.matches_with(&path[..end], OPTIONS))
+        .map_or(0, |(_, len)| len)
 }
 
 /// Strip base directories from absolute paths in preprocessor output.
@@ -1324,7 +1353,11 @@ pub fn strip_basedirs<'a>(preprocessor_output: &'a [u8], basedirs: &[Vec<u8>]) -
     #[cfg(target_os = "windows")]
     let normalized_output = &normalize_win_path(preprocessor_output);
 
+    let globs = compile_basedir_globs(basedirs);
     for (idx, basedir_bytes) in basedirs.iter().enumerate() {
+        if globs.get(idx).is_some_and(Option::is_some) {
+            continue;
+        }
         let basedir = basedir_bytes.as_slice();
 
         // On Windows, preprocessor output quotes paths as C string literals
@@ -1361,25 +1394,24 @@ pub fn strip_basedirs<'a>(preprocessor_output: &'a [u8], basedirs: &[Vec<u8>]) -
 
     // Glob basedirs can't be searched for as a substring. Try them where an
     // absolute path starts at one of the same boundaries instead.
-    let globs = compile_basedir_globs(basedirs);
     if !globs.is_empty() {
         for pos in memchr::memchr_iter(b'/', normalized_output) {
-            let is_boundary = pos == 0
-                || normalized_output[pos - 1].is_ascii_whitespace()
-                || normalized_output[pos - 1] == b'"'
-                || normalized_output[pos - 1] == b'<';
-            if !is_boundary {
-                continue;
-            }
+            // A quoted path runs to the closing quote, spaces and all.
+            let ends_path: fn(&u8) -> bool = match pos.checked_sub(1).map(|i| normalized_output[i])
+            {
+                Some(b'"') => |b| matches!(b, b'"' | b'\n'),
+                Some(b'<') => |b| matches!(b, b'>' | b'\n'),
+                None => |b| b.is_ascii_whitespace(),
+                Some(b) if b.is_ascii_whitespace() => |b| b.is_ascii_whitespace(),
+                Some(_) => continue,
+            };
             let rest = &normalized_output[pos..];
-            let path_len = rest
-                .iter()
-                .position(|b| b.is_ascii_whitespace() || matches!(b, b'"' | b'>' | 0))
-                .unwrap_or(rest.len());
-            for (idx, pattern) in &globs {
+            let path_len = rest.iter().position(ends_path).unwrap_or(rest.len());
+            for (idx, pattern) in globs.iter().enumerate() {
+                let Some(pattern) = pattern else { continue };
                 let len = glob_basedir_match_len(pattern, &rest[..path_len], false);
                 if len > 0 {
-                    matches.push((pos, len, *idx));
+                    matches.push((pos, len, idx));
                 }
             }
         }
@@ -1482,10 +1514,10 @@ pub fn strip_basedirs_from_arg<'a>(arg: &'a [u8], basedirs: &[Vec<u8>]) -> Cow<'
         let mut matched = 0;
         let mut matched_idx = 0;
         for (i, basedir) in basedirs.iter().enumerate() {
-            let len = match globs.iter().find(|(g, _)| *g == i) {
+            let len = match globs.get(i).and_then(Option::as_ref) {
                 // A glob's `*` matches an `=`, so the path is cut off at the
                 // first one: it ends there in -ffile-prefix-map=<path>=<path>.
-                Some((_, pattern)) => {
+                Some(pattern) => {
                     let path_len = memchr::memchr(b'=', rest).unwrap_or(rest.len());
                     glob_basedir_match_len(pattern, &rest[..path_len], true)
                 }
@@ -2309,13 +2341,37 @@ mod tests {
             strip(b"/w/wt-[ab]/", b"/w/wt-c/src/x.rs"),
             b"/w/wt-c/src/x.rs"
         );
-        // Case-sensitive, like a literal basedir off Windows.
+        // `**` stops at the first directory that fits.
+        assert_eq!(
+            strip(b"/w/**/proj/", b"/w/a/proj/crates/proj/src/x.rs"),
+            b"crates/proj/src/x.rs"
+        );
+        // A pattern character can be matched literally in brackets.
+        assert_eq!(strip(b"/w/[[]a]/", b"/w/[a]/src/x.rs"), b"src/x.rs");
+        assert_eq!(strip(b"/w/[[]a]/", b"/w/a/src/x.rs"), b"/w/a/src/x.rs");
+        // `*` doesn't match the empty component of a doubled slash, which a
+        // literal basedir wouldn't match across either.
+        assert_eq!(
+            strip(b"/w/*/*/", b"/w//org/a/src/x.rs"),
+            b"/w//org/a/src/x.rs"
+        );
+        // Case-sensitive, like a literal basedir off Windows, where arguments
+        // are lowercased before matching.
+        #[cfg(not(target_os = "windows"))]
         assert_eq!(
             strip(b"/w/*/proj/", b"/w/a/Proj/src/x.rs"),
             b"/w/a/Proj/src/x.rs"
         );
-        // Invalid UTF-8 after the matched prefix doesn't prevent the match.
-        assert_eq!(strip(b"/w/*/", b"/w/a/\xff/x.rs"), b"\xff/x.rs");
+        // Invalid UTF-8 after the matched prefix doesn't prevent the match,
+        // but a component cut short by it isn't a whole directory.
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert_eq!(strip(b"/w/*/", b"/w/a/\xff/x.rs"), b"\xff/x.rs");
+            assert_eq!(
+                strip(b"/w/pro?/", b"-I/w/proj\xffdata/include"),
+                b"-I/w/proj\xffdata/include"
+            );
+        }
     }
 
     #[test]
@@ -2367,6 +2423,18 @@ mod tests {
             String::from_utf8_lossy(&output),
             String::from_utf8_lossy(expected)
         );
+
+        // A quoted path runs to the closing quote, spaces included.
+        let basedirs = vec![b"/users/u/my repos/*/".to_vec()];
+        let output = super::strip_basedirs(
+            b"# 1 \"/users/u/my repos/wt1/a.c\"\n#include </users/u/my repos/wt2/b.h>",
+            &basedirs,
+        );
+        assert_eq!(&*output, b"# 1 \"a.c\"\n#include <b.h>");
+
+        // A glob's own text isn't searched for literally.
+        let output = super::strip_basedirs(b"# 1 \"/w/[ab]/x.c\"", &[b"/w/[ab]/".to_vec()]);
+        assert_eq!(&*output, b"# 1 \"/w/[ab]/x.c\"");
 
         // Mixed with a literal basedir, the longest match at a position wins.
         let basedirs = vec![b"/home/user1/".to_vec(), b"/home/*/project/".to_vec()];

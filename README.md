@@ -349,7 +349,7 @@ An entry containing `*`, `?` or `[` is a glob pattern, for checkouts whose names
 export SCCACHE_BASEDIRS="/home/user/repos/*/*:/home/user/worktrees/*/project"
 ```
 
-`*`, `?` and `[...]` match within one path component, and `**` matches any number of components. A glob matches whole directories: `/home/user/repos/*/*` strips `/home/user/repos/org/project/` from `/home/user/repos/org/project/src/lib.rs`, not more. As with literal entries, the longest match wins. In preprocessed C and C++ source, glob entries are only matched against paths that start with `/`.
+`*`, `?` and `[...]` match within one path component, and `**` matches any number of components. A glob matches whole directories, and the fewest that fit: `/home/user/repos/*/*` strips `/home/user/repos/org/project/` from `/home/user/repos/org/project/src/lib.rs`, and `/home/user/**/project` stops at the first `project` directory. Across entries, as with literal ones, the longest match wins. To match a pattern character literally, put it in brackets: `/home/user/[[]work]` matches `/home/user/[work]`. In preprocessed C and C++ source, glob entries are only matched against paths that start with `/`, so not against Windows drive-letter paths.
 
 Base directories are stripped from the preprocessed source and from the compiler arguments alike. The arguments matter because a flag can name the tree it is building: `-ffile-prefix-map=/home/user/project=.` makes the object file independent of where the tree is checked out, but the flag itself is not, and it is hashed verbatim.
 

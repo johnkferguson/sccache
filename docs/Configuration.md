@@ -33,8 +33,9 @@ server_startup_timeout_ms = 10000
 # An entry containing `*`, `?` or `[` is a glob pattern, for checkouts
 # whose names can't be listed ahead of time, such as auto-named Git
 # worktrees. `*`, `?` and `[...]` match within one path component and
-# `**` matches any number of them. A glob matches whole directories,
-# and the longest match among all entries is stripped.
+# `**` matches any number of them. A glob matches the fewest whole
+# directories that fit, and the longest match among all entries is
+# stripped. Bracket a pattern character to match it literally: `[[]`.
 #
 # Example:
 #   basedir = ["/home/user/project"] results in the path prefix rewrite:
