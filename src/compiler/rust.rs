@@ -1780,19 +1780,43 @@ fn strip_basedirs_os<'a>(value: &'a OsStr, basedirs: &[Vec<u8>]) -> Cow<'a, OsSt
 }
 
 /// Whether `files` mention `OUT_DIR`, and only as the start of an `include!`,
-/// `include_str!` or `include_bytes!` path: `include!(concat!(env!("OUT_DIR"), "/x.rs"))`.
-/// Such an `OUT_DIR` never reaches the output.
+/// `include_str!` or `include_bytes!` path: `include!(concat!(env!("OUT_DIR"), "/x.rs"))`,
+/// with any macro delimiter, as in `include! { ... }`. Such an `OUT_DIR` never reaches
+/// the output.
 ///
 /// Any other mention, such as `option_env!("OUT_DIR")`, a comment or a `std::env!`
 /// path, or a file that can't be read, gives `false`. An `env!("OUT_DIR")` coming
 /// from another crate's macro is not seen.
 fn out_dir_only_names_includes(files: &[PathBuf]) -> bool {
-    /// `text` without `tokens` at its end, allowing whitespace between them.
-    fn strip_tokens_end<'a>(mut text: &'a [u8], tokens: &[u8]) -> Option<&'a [u8]> {
-        for &c in tokens.iter().rev() {
-            text = text.trim_ascii_end().strip_suffix(&[c])?;
+    /// `text` without a `name!(`, `name!{` or `name![` at its end, allowing whitespace
+    /// between the tokens, and the delimiter that closes the call.
+    fn strip_call_end<'a>(text: &'a [u8], name: &[u8]) -> Option<(&'a [u8], u8)> {
+        let (text, close) = match text.trim_ascii_end().split_last()? {
+            (b'(', text) => (text, b')'),
+            (b'{', text) => (text, b'}'),
+            (b'[', text) => (text, b']'),
+            _ => return None,
+        };
+        let text = text.trim_ascii_end().strip_suffix(b"!")?;
+        Some((text.trim_ascii_end().strip_suffix(name)?, close))
+    }
+
+    /// Whether the `OUT_DIR` between `before` and `after` starts an include path.
+    fn names_include(before: &[u8], after: &[u8]) -> Option<()> {
+        let (before, close) = strip_call_end(before.strip_suffix(b"\"")?, b"env")?;
+        let after = after.strip_prefix(b"\"")?.trim_ascii_start();
+        if !after.starts_with(&[close]) {
+            return None;
         }
-        Some(text)
+        let (before, _) = strip_call_end(before, b"concat")?;
+        [&b"include"[..], b"include_str", b"include_bytes"]
+            .iter()
+            .filter_map(|mac| strip_call_end(before, mac))
+            .any(|(b, _)| {
+                !b.last()
+                    .is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_' || c == b'$')
+            })
+            .then_some(())
     }
 
     let mut mentioned = false;
@@ -1806,21 +1830,7 @@ fn out_dir_only_names_includes(files: &[PathBuf]) -> bool {
         };
         for at in memchr::memmem::find_iter(&text, b"OUT_DIR") {
             mentioned = true;
-            let closed = text[at + b"OUT_DIR".len()..]
-                .strip_prefix(b"\"")
-                .is_some_and(|rest| rest.trim_ascii_start().starts_with(b")"));
-            let names_include = closed
-                && strip_tokens_end(&text[..at], b"concat!(env!(\"").is_some_and(|before| {
-                    [&b"include!("[..], b"include_str!(", b"include_bytes!("]
-                        .iter()
-                        .filter_map(|mac| strip_tokens_end(before, mac))
-                        .any(|b| {
-                            !b.last().is_some_and(|&c| {
-                                c.is_ascii_alphanumeric() || c == b'_' || c == b'$'
-                            })
-                        })
-                });
-            if !names_include {
+            if names_include(&text[..at], &text[at + b"OUT_DIR".len()..]).is_none() {
                 return false;
             }
         }
@@ -4922,6 +4932,7 @@ foo.rs:
     #[test_case("CARGO_TARGET_TMPDIR", "target/tmp", "", false ; "target tmpdir")]
     #[test_case("OUT_DIR", "target/out", "const D: &str = env!(\"OUT_DIR\");", false ; "out dir read")]
     #[test_case("OUT_DIR", "target/out", "include!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"));", true ; "out dir include")]
+    #[test_case("OUT_DIR", "target/out", "include! { concat!(env!(\"OUT_DIR\"), \"/x.rs\") }", true ; "out dir braced include")]
     fn test_hash_env_dep_under_basedir(var: &str, sub: &str, src: &str, alike: bool) {
         fn key(f: &TestFixture, var: &str, sub: &str, src: &str, basedirs: Vec<Vec<u8>>) -> String {
             let root = f.tempdir.path();
@@ -5008,6 +5019,25 @@ foo.rs:
         );
     }
 
+    #[test_case("include!(concat!(env!(\"OUT_DIR\"), \"/a.rs\"));" ; "include parens")]
+    #[test_case("include! { concat!(env!(\"OUT_DIR\"), \"/radix_bases.rs\") }" ; "include braces num-bigint")]
+    #[test_case("include![concat!(env!(\"OUT_DIR\"), \"/a.rs\")];" ; "include brackets")]
+    #[test_case("const S: &str = include_str! (concat!(env!(\"OUT_DIR\"), \"/s\"));" ; "include_str parens")]
+    #[test_case("const S: &str = include_str!{concat!(env!(\"OUT_DIR\"), \"/s\")};" ; "include_str braces")]
+    #[test_case("const S: &str = include_str! [concat!(env!(\"OUT_DIR\"), \"/s\")];" ; "include_str brackets")]
+    #[test_case("const B: &[u8] = include_bytes!\n(concat!(env!(\"OUT_DIR\"), \"/b\"));" ; "include_bytes parens")]
+    #[test_case("const B: &[u8] = include_bytes!\t{ concat!(env!(\"OUT_DIR\"), \"/b\") };" ; "include_bytes braces")]
+    #[test_case("const B: &[u8] = include_bytes![concat!(env!(\"OUT_DIR\"), \"/b\")];" ; "include_bytes brackets")]
+    #[test_case("include ! { concat! [ env! { \"OUT_DIR\" }, \"/a.rs\" ] }" ; "every call braced")]
+    fn test_out_dir_only_names_includes_delimiters(text: &str) {
+        let f = TestFixture::new();
+        let file = create_file(f.tempdir.path(), "lib.rs", |mut f| {
+            f.write_all(text.as_bytes())
+        })
+        .unwrap();
+        assert!(out_dir_only_names_includes(&[file]));
+    }
+
     #[test]
     fn test_out_dir_only_names_includes() {
         let f = TestFixture::new();
@@ -5042,6 +5072,11 @@ foo.rs:
             "macro_rules! m { ($include:ident) => { $include!(concat!(env!(\"OUT_DIR\"), \"/a\")) } }",
             "include!(concat!(env!(\"OUT_DIR_X\"), \"/a.rs\"));",
             "// OUT_DIR",
+            "const D: &str = env![\"OUT_DIR\"];",
+            "const D: &str = env! { \"OUT_DIR\" };",
+            "include!(concat!(env!(\"OUT_DIR\"]), \"/a.rs\"));",
+            "include! < concat!(env!(\"OUT_DIR\"), \"/a.rs\") >",
+            "include_bytes { concat!(env!(\"OUT_DIR\"), \"/b\") }",
         ] {
             assert!(
                 !check(&["include!(concat!(env!(\"OUT_DIR\"), \"/a.rs\"));", other]),
