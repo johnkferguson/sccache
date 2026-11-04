@@ -4399,6 +4399,56 @@ foo.rs:
         );
     }
 
+    /// A crate built with `cargo build -p` keys the same as when it's built as a
+    /// dependency, except where CARGO_PRIMARY_PACKAGE changes the output.
+    #[test]
+    fn test_hash_cargo_primary_package() {
+        let f = TestFixture::new();
+        let key = |env_vars: &[(&str, &str)], env_deps: &[(&str, OsString)]| {
+            let env_vars: Vec<(OsString, OsString)> =
+                env_vars.iter().map(|(k, v)| (k.into(), v.into())).collect();
+            hash_key_with(
+                &f,
+                &[
+                    "--emit",
+                    "link",
+                    "foo.rs",
+                    "--out-dir",
+                    "out",
+                    "--crate-name",
+                    "foo",
+                    "--crate-type",
+                    "lib",
+                ],
+                &env_vars,
+                env_deps,
+                nothing,
+                MockStorage::new(None, false),
+            )
+        };
+        let pkg = ("CARGO_PKG_NAME", "foo");
+        let primary = ("CARGO_PRIMARY_PACKAGE", "1");
+        assert_eq!(key(&[pkg], &[]), key(&[pkg, primary], &[]));
+
+        // The source reads it with `option_env!`.
+        assert_ne!(
+            key(&[pkg], &[("CARGO_PRIMARY_PACKAGE", "".into())]),
+            key(&[pkg, primary], &[("CARGO_PRIMARY_PACKAGE", "1".into())])
+        );
+
+        // `cargo clippy -- --no-deps` lints only primary packages.
+        let no_deps = (
+            "CLIPPY_ARGS",
+            "-Dwarnings__CLIPPY_HACKERY__--no-deps__CLIPPY_HACKERY__",
+        );
+        assert_ne!(
+            key(&[pkg, no_deps], &[]),
+            key(&[pkg, no_deps, primary], &[])
+        );
+        let lints = ("CLIPPY_ARGS", "-Dwarnings__CLIPPY_HACKERY__");
+        assert_eq!(key(&[pkg, lints], &[]), key(&[pkg, lints, primary], &[]));
+    }
+
     fn hash_key<F>(
         f: &TestFixture,
         args: &[&'static str],
@@ -4641,56 +4691,6 @@ foo.rs:
             )
         };
         assert_ne!(key("".into()), key(root.clone().into()));
-    }
-
-    /// A crate built with `cargo build -p` keys the same as when it's built as a
-    /// dependency, except where CARGO_PRIMARY_PACKAGE changes the output.
-    #[test]
-    fn test_hash_cargo_primary_package() {
-        let f = TestFixture::new();
-        let key = |env_vars: &[(&str, &str)], env_deps: &[(&str, OsString)]| {
-            let env_vars: Vec<(OsString, OsString)> =
-                env_vars.iter().map(|(k, v)| (k.into(), v.into())).collect();
-            hash_key_with(
-                &f,
-                &[
-                    "--emit",
-                    "link",
-                    "foo.rs",
-                    "--out-dir",
-                    "out",
-                    "--crate-name",
-                    "foo",
-                    "--crate-type",
-                    "lib",
-                ],
-                &env_vars,
-                env_deps,
-                nothing,
-                MockStorage::new(None, false),
-            )
-        };
-        let pkg = ("CARGO_PKG_NAME", "foo");
-        let primary = ("CARGO_PRIMARY_PACKAGE", "1");
-        assert_eq!(key(&[pkg], &[]), key(&[pkg, primary], &[]));
-
-        // The source reads it with `option_env!`.
-        assert_ne!(
-            key(&[pkg], &[("CARGO_PRIMARY_PACKAGE", "".into())]),
-            key(&[pkg, primary], &[("CARGO_PRIMARY_PACKAGE", "1".into())])
-        );
-
-        // `cargo clippy -- --no-deps` lints only primary packages.
-        let no_deps = (
-            "CLIPPY_ARGS",
-            "-Dwarnings__CLIPPY_HACKERY__--no-deps__CLIPPY_HACKERY__",
-        );
-        assert_ne!(
-            key(&[pkg, no_deps], &[]),
-            key(&[pkg, no_deps, primary], &[])
-        );
-        let lints = ("CLIPPY_ARGS", "-Dwarnings__CLIPPY_HACKERY__");
-        assert_eq!(key(&[pkg, lints], &[]), key(&[pkg, lints, primary], &[]));
     }
 
     #[test_case(true ; "with preprocessor cache")]
