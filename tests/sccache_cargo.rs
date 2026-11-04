@@ -699,3 +699,78 @@ fn test_rust_cargo_basedirs_manifest_dir_not_shared() -> Result<()> {
         .try_success()?;
     Ok(())
 }
+
+/// Write a crate to `checkout` that uses a proc macro from a path dependency.
+/// Cargo passes the proc macro a bare `--extern proc_macro`.
+fn write_proc_macro_crate(checkout: &Path) -> Result<()> {
+    let package = |name: &str| {
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
+    };
+    fs::create_dir_all(checkout.join("src"))?;
+    fs::create_dir_all(checkout.join("pm/src"))?;
+    fs::write(
+        checkout.join("Cargo.toml"),
+        package("proc-macro-test") + "\n[dependencies]\npm = { path = \"pm\" }\n",
+    )?;
+    fs::write(
+        checkout.join("src/lib.rs"),
+        "pub fn answer() -> u32 { pm::answer!() }\n",
+    )?;
+    fs::write(
+        checkout.join("pm/Cargo.toml"),
+        package("pm") + "\n[lib]\nproc-macro = true\n",
+    )?;
+    fs::write(
+        checkout.join("pm/src/lib.rs"),
+        r#"use proc_macro::TokenStream;
+
+#[proc_macro]
+pub fn answer(_: TokenStream) -> TokenStream {
+    "42".parse().unwrap()
+}
+"#,
+    )?;
+    Ok(())
+}
+
+/// A proc macro and the crate using it, built from two checkouts listed in
+/// `SCCACHE_BASEDIRS`, both hit in the second one.
+#[test]
+#[serial]
+fn test_rust_cargo_basedirs_proc_macro_other_checkout() -> Result<()> {
+    let test_info = SccacheTest::new(Some(&[(
+        "SCCACHE_RUST_CRATE_TYPE_ALLOW_HASH",
+        "test".into(),
+    )]))?;
+    let tempdir = real_tempdir(&test_info)?;
+    let [a, b] = ["a", "b"].map(|name| tempdir.join(name));
+    let basedirs = std::env::join_paths([&a, &b])?.into_string().unwrap();
+    restart_sccache(
+        &test_info,
+        Some(vec![("SCCACHE_BASEDIRS".into(), basedirs)]),
+    )?;
+
+    write_proc_macro_crate(&a)?;
+    cargo_build(&test_info, &a)?;
+    Command::new(SCCACHE_BIN.as_os_str())
+        .arg("--zero-stats")
+        .assert()
+        .try_success()?;
+    write_proc_macro_crate(&b)?;
+    cargo_build(&test_info, &b)?;
+
+    test_info
+        .show_stats()?
+        .try_stdout(
+            predicates::str::contains(
+                r#""cache_hits":{"counts":{"Rust":2},"adv_counts":{"rust":2}}"#,
+            )
+            .from_utf8(),
+        )?
+        .try_stdout(
+            predicates::str::contains(r#""cache_misses":{"counts":{},"adv_counts":{}}"#)
+                .from_utf8(),
+        )?
+        .try_success()?;
+    Ok(())
+}

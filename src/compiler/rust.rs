@@ -1235,31 +1235,52 @@ impl IntoArg for ArgUnstable {
     }
 }
 
+/// Crates rustc ships in its sysroot, which an `--extern` may name without a
+/// path, as cargo's bare `--extern proc_macro` for proc-macro crates does. rustc
+/// finds them in the sysroot, which comes with the hashed compiler.
+const SYSROOT_CRATES: &[&str] = &["alloc", "core", "proc_macro", "std", "test"];
+
 #[derive(Clone, Debug, PartialEq)]
 struct ArgExtern {
     name: String,
-    path: PathBuf,
+    path: Option<PathBuf>,
 }
 impl FromArg for ArgExtern {
     fn process(arg: OsString) -> ArgParseResult<Self> {
-        if let (name, Some(path)) = split_os_string_arg(arg, "=")? {
-            Ok(ArgExtern {
+        match split_os_string_arg(arg, "=")? {
+            (name, Some(path)) => Ok(ArgExtern {
                 name,
-                path: path.into(),
-            })
-        } else {
-            Err(ArgParseError::Other("no path for extern"))
+                path: Some(path.into()),
+            }),
+            // Any other bare name would come from an `-L` path, which isn't
+            // hashed. The name may carry modifiers, as in `noprelude:alloc`.
+            (name, None)
+                if SYSROOT_CRATES.contains(&name.rsplit(':').next().unwrap_or_default()) =>
+            {
+                Ok(ArgExtern { name, path: None })
+            }
+            (_, None) => Err(ArgParseError::Other("no path for extern")),
         }
     }
 }
 impl IntoArg for ArgExtern {
     fn into_arg_os_string(self) -> OsString {
-        let ArgExtern { name, path } = self;
-        make_os_string!(name, "=", path)
+        match self {
+            ArgExtern {
+                name,
+                path: Some(path),
+            } => make_os_string!(name, "=", path),
+            ArgExtern { name, path: None } => name.into(),
+        }
     }
     fn into_arg_string(self, transformer: PathTransformerFn<'_>) -> ArgToStringResult {
-        let ArgExtern { name, path } = self;
-        Ok(format!("{}={}", name, path.into_arg_string(transformer)?))
+        match self {
+            ArgExtern {
+                name,
+                path: Some(path),
+            } => Ok(format!("{}={}", name, path.into_arg_string(transformer)?)),
+            ArgExtern { name, path: None } => Ok(name),
+        }
     }
 }
 
@@ -1518,7 +1539,7 @@ fn parse_arguments(
             }
             Some(CrateName(value)) => crate_name = Some(value.clone()),
             Some(OutDir(value)) => output_dir = Some(value.clone()),
-            Some(Extern(ArgExtern { path, .. })) => externs.push(path.clone()),
+            Some(Extern(ArgExtern { path, .. })) => externs.extend(path.clone()),
             Some(CodeGen(ArgCodegen { opt, value })) => {
                 match (opt.as_ref(), value) {
                     ("extra-filename", Some(value)) => extra_filename = Some(value.to_owned()),
@@ -3647,6 +3668,57 @@ LLVM version: 15.0.2
     }
 
     #[test]
+    fn test_parse_arguments_bare_extern() {
+        let parse = |name: &str| {
+            let args: Vec<OsString> = [
+                "--emit",
+                "link",
+                "foo.rs",
+                "--out-dir",
+                "out",
+                "--crate-name",
+                "foo",
+                "--crate-type",
+                "proc-macro",
+                "--extern",
+                "dep=libdep.rlib",
+                "--extern",
+                name,
+            ]
+            .map(OsString::from)
+            .to_vec();
+            parse_arguments(&args, ".".as_ref(), Some("linker".to_owned()))
+        };
+        for name in ["proc_macro", "noprelude:alloc"] {
+            match parse(name) {
+                CompilerArguments::Ok(a) => {
+                    assert_eq!(a.externs, ovec!["libdep.rlib"]);
+                    let args = a
+                        .arguments
+                        .iter()
+                        .flat_map(|a| a.iter_os_strings())
+                        .collect::<Vec<_>>();
+                    assert!(
+                        args.ends_with(&["--extern".into(), name.into()]),
+                        "{args:?}"
+                    );
+                }
+                o => panic!("{name}: got unexpected parse result: {o:?}"),
+            }
+        }
+        // A bare name outside the sysroot would come from an unhashed `-L` path.
+        for name in ["dep", "proc_macro2", "noprelude:dep"] {
+            assert!(
+                matches!(
+                    parse(name),
+                    CompilerArguments::CannotCache("argument parse", _)
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn test_hash_crate_type_allow_hash() {
         let f = TestFixture::new();
         let key = |crate_type: &str, allow_hash: Option<&str>| {
@@ -4753,6 +4825,52 @@ foo.rs:
         assert_eq!(
             key(&a, var, sub, src, both.clone()) == key(&b, var, sub, src, both),
             alike
+        );
+    }
+
+    /// A proc macro in two checkouts keys alike, as cargo builds it, so crates
+    /// that use it can hit too. One that reads its manifest dir still keys apart.
+    #[test]
+    fn test_hash_proc_macro_basedirs() {
+        fn key(f: &TestFixture, env_deps: &[(&str, OsString)], basedirs: Vec<Vec<u8>>) -> String {
+            let root = f.tempdir.path();
+            let deps = root.join("target/debug/deps");
+            hash_key_with_allow_hash(
+                f,
+                &[
+                    OsString::from("--emit"),
+                    "dep-info,link".into(),
+                    "foo.rs".into(),
+                    "--out-dir".into(),
+                    deps.clone().into(),
+                    "--crate-name".into(),
+                    "foo".into(),
+                    "--crate-type".into(),
+                    "proc-macro".into(),
+                    "-L".into(),
+                    format!("dependency={}", deps.display()).into(),
+                    "--extern".into(),
+                    format!("syn={}", deps.join("libsyn.rlib").display()).into(),
+                    "--extern".into(),
+                    "proc_macro".into(),
+                ],
+                &[("CARGO_MANIFEST_DIR".into(), root.into())],
+                env_deps,
+                nothing,
+                MockStorage::new(None, false).with_basedirs(basedirs),
+                Some("linker"),
+            )
+        }
+
+        let a = TestFixture::new();
+        let b = TestFixture::new();
+        let both = vec![basedir(a.tempdir.path()), basedir(b.tempdir.path())];
+        assert_ne!(key(&a, &[], vec![]), key(&b, &[], vec![]));
+        assert_eq!(key(&a, &[], both.clone()), key(&b, &[], both.clone()));
+        let manifest_dir = |f: &TestFixture| [("CARGO_MANIFEST_DIR", f.tempdir.path().into())];
+        assert_ne!(
+            key(&a, &manifest_dir(&a), both.clone()),
+            key(&b, &manifest_dir(&b), both)
         );
     }
 
