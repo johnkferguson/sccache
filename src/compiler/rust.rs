@@ -560,6 +560,34 @@ where
     deps
 }
 
+/// Whether any of `files` contains `needle`. A file that can't be read counts as
+/// containing it.
+async fn any_file_contains(
+    files: Vec<PathBuf>,
+    needle: &'static [u8],
+    pool: &tokio::runtime::Handle,
+) -> Result<bool> {
+    if files.is_empty() {
+        return Ok(false);
+    }
+    let found = pool
+        .spawn_blocking(move || {
+            let finder = memchr::memmem::Finder::new(needle);
+            files.iter().any(|path| {
+                let Ok(file) = std::fs::File::open(path) else {
+                    return true;
+                };
+                match unsafe { memmap2::MmapOptions::new().map_copy_read_only(&file) } {
+                    Ok(map) => finder.find(&map).is_some(),
+                    // Mapping an empty file fails on some platforms.
+                    Err(_) => file.metadata().map_or(true, |m| m.len() != 0),
+                }
+            })
+        })
+        .await?;
+    Ok(found)
+}
+
 fn parse_env_dep_info(dep_info: &str) -> Vec<(OsString, OsString)> {
     let mut env_deps = Vec::new();
     for line in dep_info.lines() {
@@ -1918,18 +1946,41 @@ where
 
         let target_json_hash = hash_all(&target_json_files, pool);
 
+        // Cargo sets CARGO_PRIMARY_PACKAGE only for packages named on its command line,
+        // so hashing it keys a crate built with `-p` apart from the same crate built as
+        // a dependency. rustc itself never reads it, and `env!`/`option_env!` reads land
+        // in the env-deps. Code that runs inside the compile and reads it with
+        // `std::env::var` isn't recorded, like cosmwasm-derive's and rustler's proc
+        // macros or clippy-driver, so keep it whenever the compiler or a proc macro
+        // contains its name.
+        let primary_package_read = {
+            let mut files = vec![];
+            if env_vars.iter().any(|(k, _)| k == "CARGO_PRIMARY_PACKAGE") {
+                files.push(self.executable.clone());
+                files.extend(
+                    abs_externs
+                        .iter()
+                        .filter(|e| e.extension().is_some_and(|e| e == DLL_EXTENSION))
+                        .cloned(),
+                );
+            }
+            any_file_contains(files, b"CARGO_PRIMARY_PACKAGE", pool)
+        };
+
         // Invoke the compiler and perform all hashing operations on the files.
         let (
             (source_files, source_hashes, mut env_deps, dep_info_text),
             extern_hashes,
             staticlib_hashes,
             target_json_hash,
+            primary_package_read,
             mut outputs,
         ) = futures::try_join!(
             source_files_and_hashes_and_env_deps,
             extern_hashes,
             staticlib_hashes,
             target_json_hash,
+            primary_package_read,
             outputs,
         )?;
 
@@ -2046,10 +2097,12 @@ where
             // already uniquely identify the relevant registries.
             // CARGO_BUILD_JOBS only affects Cargo's parallelism, not rustc output.
             // CARGO_ENCODED_RUSTFLAGS is already cached in argument list
+            // CARGO_PRIMARY_PACKAGE: see `primary_package_read`.
             if var == "CARGO_MAKEFLAGS"
                 || var.starts_with("CARGO_REGISTRIES_")
                 || var == "CARGO_BUILD_JOBS"
                 || var == "CARGO_ENCODED_RUSTFLAGS"
+                || (var == "CARGO_PRIMARY_PACKAGE" && !primary_package_read)
             {
                 continue;
             }
@@ -4558,6 +4611,57 @@ foo.rs:
         );
     }
 
+    /// A crate built with `cargo build -p` keys the same as when it's built as a
+    /// dependency, unless something in the compile can read CARGO_PRIMARY_PACKAGE.
+    #[test]
+    fn test_hash_cargo_primary_package() {
+        let f = TestFixture::new();
+        let pm = format!("libpm.{DLL_EXTENSION}");
+        // `rustc` and `macro_` are the contents of the compiler and of a proc macro.
+        let key = |primary: bool, env_deps: &[(&str, OsString)], rustc: &str, macro_: &str| {
+            let mut env_vars = vec![("CARGO_PKG_NAME".into(), "foo".into())];
+            if primary {
+                env_vars.push(("CARGO_PRIMARY_PACKAGE".into(), "1".into()));
+            }
+            let pm = pm.clone();
+            hash_key_with(
+                &f,
+                &[
+                    "--emit",
+                    "link",
+                    "foo.rs",
+                    "--out-dir",
+                    "out",
+                    "--crate-name",
+                    "foo",
+                    "--crate-type",
+                    "lib",
+                    "--extern",
+                    &format!("pm={pm}"),
+                ],
+                &env_vars,
+                env_deps,
+                move |dir: &Path| {
+                    fs::write(dir.join("rustc"), rustc)?;
+                    fs::write(dir.join(&pm), macro_)?;
+                    Ok(())
+                },
+                MockStorage::new(None, false),
+            )
+        };
+        let reads = "env::var(CARGO_PRIMARY_PACKAGE)";
+        assert_eq!(key(false, &[], "", "serde"), key(true, &[], "", "serde"));
+        // cosmwasm-derive emits wasm exports only for the primary package.
+        assert_ne!(key(false, &[], "", reads), key(true, &[], "", reads));
+        // clippy-driver lints only the primary package under `--no-deps`.
+        assert_ne!(key(false, &[], reads, ""), key(true, &[], reads, ""));
+        // The source reads it with `option_env!`.
+        assert_ne!(
+            key(false, &[("CARGO_PRIMARY_PACKAGE", "".into())], "", ""),
+            key(true, &[("CARGO_PRIMARY_PACKAGE", "1".into())], "", "")
+        );
+    }
+
     fn hash_key<F>(
         f: &TestFixture,
         args: &[&'static str],
@@ -4626,9 +4730,10 @@ foo.rs:
             let s = format!("Failed to create {:?}", e);
             f.touch(e.to_str().unwrap()).expect(&s);
         }
+        f.touch("rustc").expect("Failed to create rustc");
         pre_func(f.tempdir.path()).expect("Failed to execute pre_func");
         let mut hasher = Box::new(RustHasher {
-            executable: "rustc".into(),
+            executable: f.tempdir.path().join("rustc"),
             host: "x86-64-unknown-unknown-unknown".to_owned(),
             version: TEST_RUSTC_VERSION.to_string(),
             sysroot: f.tempdir.path().join("sysroot"),
