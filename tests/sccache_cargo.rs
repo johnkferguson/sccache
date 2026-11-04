@@ -550,6 +550,11 @@ fn test_rust_cargo_dep_info_from_other_checkout() -> Result<()> {
 /// so the checkout's path reaches both crates' keys through the cwd,
 /// `CARGO_MANIFEST_DIR` and the dependency's `OUT_DIR` env-dep.
 fn write_out_dir_crate(checkout: &Path) -> Result<()> {
+    write_out_dir_crate_with_lib(checkout, "pub fn answer() -> u32 { dep::ANSWER }\n")
+}
+
+/// [`write_out_dir_crate`] with `lib_rs` as the crate's own source.
+fn write_out_dir_crate_with_lib(checkout: &Path, lib_rs: &str) -> Result<()> {
     let package = |name: &str| {
         format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
     };
@@ -559,10 +564,7 @@ fn write_out_dir_crate(checkout: &Path) -> Result<()> {
         checkout.join("Cargo.toml"),
         package("out-dir-test") + "\n[dependencies]\ndep = { path = \"dep\" }\n",
     )?;
-    fs::write(
-        checkout.join("src/lib.rs"),
-        "pub fn answer() -> u32 { dep::ANSWER }\n",
-    )?;
+    fs::write(checkout.join("src/lib.rs"), lib_rs)?;
     fs::write(checkout.join("dep/Cargo.toml"), package("dep"))?;
     fs::write(
         checkout.join("dep/build.rs"),
@@ -636,5 +638,64 @@ fn test_rust_cargo_basedirs_other_checkout() -> Result<()> {
         dep_info.contains(b.to_str().unwrap()),
         "dep-info does not name checkout b:\n{dep_info}"
     );
+    Ok(())
+}
+
+/// A crate that keeps `env!("CARGO_MANIFEST_DIR")`, built from two checkouts listed in
+/// `SCCACHE_BASEDIRS`, misses in the second one and so runs with its own path. Its
+/// dependency, which only includes from `OUT_DIR`, still hits.
+#[test]
+#[serial]
+fn test_rust_cargo_basedirs_manifest_dir_not_shared() -> Result<()> {
+    let test_info = SccacheTest::new(None)?;
+    let tempdir = real_tempdir(&test_info)?;
+    let [a, b] = ["a", "b"].map(|name| tempdir.join(name));
+    let basedirs = std::env::join_paths([&a, &b])?.into_string().unwrap();
+    restart_sccache(
+        &test_info,
+        Some(vec![("SCCACHE_BASEDIRS".into(), basedirs)]),
+    )?;
+
+    for checkout in [&a, &b] {
+        write_out_dir_crate_with_lib(
+            checkout,
+            "pub fn dir() -> &'static str { let _ = dep::ANSWER; env!(\"CARGO_MANIFEST_DIR\") }\n",
+        )?;
+        fs::write(
+            checkout.join("src/main.rs"),
+            "fn main() { println!(\"{}\", out_dir_test::dir()); }\n",
+        )?;
+    }
+    cargo_build(&test_info, &a)?;
+    Command::new(SCCACHE_BIN.as_os_str())
+        .arg("--zero-stats")
+        .assert()
+        .try_success()?;
+    let target_b = cargo_build(&test_info, &b)?;
+
+    test_info
+        .show_stats()?
+        .try_stdout(
+            predicates::str::contains(
+                r#""cache_hits":{"counts":{"Rust":1},"adv_counts":{"rust":1}}"#,
+            )
+            .from_utf8(),
+        )?
+        .try_stdout(
+            predicates::str::contains(
+                r#""cache_misses":{"counts":{"Rust":1},"adv_counts":{"rust":1}}"#,
+            )
+            .from_utf8(),
+        )?
+        .try_success()?;
+
+    Command::new(CARGO.as_os_str())
+        .args(["run", "--color=never", "--target-dir"])
+        .arg(&target_b)
+        .envs(test_info.env.iter().cloned())
+        .current_dir(&b)
+        .assert()
+        .try_stdout(predicates::str::diff(format!("{}\n", b.display())))?
+        .try_success()?;
     Ok(())
 }
