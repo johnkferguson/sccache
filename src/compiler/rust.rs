@@ -1788,9 +1788,9 @@ fn strip_basedirs_os<'a>(value: &'a OsStr, basedirs: &[Vec<u8>]) -> Cow<'a, OsSt
 /// path, or a file that can't be read, gives `false`. An `env!("OUT_DIR")` coming
 /// from another crate's macro is not seen.
 fn out_dir_only_names_includes(files: &[PathBuf]) -> bool {
-    /// `text` without a `name!(`, `name!{` or `name![` at its end, allowing whitespace
-    /// between the tokens, and the delimiter that closes the call.
-    fn strip_call_end<'a>(text: &'a [u8], name: &[u8]) -> Option<(&'a [u8], u8)> {
+    /// `text` without a `!(`, `!{` or `![` at its end, allowing whitespace around the
+    /// `!`, and the delimiter that closes the call.
+    fn strip_call_open(text: &[u8]) -> Option<(&[u8], u8)> {
         let (text, close) = match text.trim_ascii_end().split_last()? {
             (b'(', text) => (text, b')'),
             (b'{', text) => (text, b'}'),
@@ -1798,25 +1798,21 @@ fn out_dir_only_names_includes(files: &[PathBuf]) -> bool {
             _ => return None,
         };
         let text = text.trim_ascii_end().strip_suffix(b"!")?;
-        Some((text.trim_ascii_end().strip_suffix(name)?, close))
+        Some((text.trim_ascii_end(), close))
     }
 
-    /// Whether the `OUT_DIR` between `before` and `after` starts an include path.
-    fn names_include(before: &[u8], after: &[u8]) -> Option<()> {
-        let (before, close) = strip_call_end(before.strip_suffix(b"\"")?, b"env")?;
+    /// For an `OUT_DIR` between `before` and `after` that starts a
+    /// `concat!(env!("OUT_DIR"), ...)` passed to another macro, the text up to that
+    /// macro's name.
+    fn outer_call<'a>(before: &'a [u8], after: &[u8]) -> Option<&'a [u8]> {
+        let (before, close) = strip_call_open(before.strip_suffix(b"\"")?)?;
         let after = after.strip_prefix(b"\"")?.trim_ascii_start();
         if !after.starts_with(&[close]) {
             return None;
         }
-        let (before, _) = strip_call_end(before, b"concat")?;
-        [&b"include"[..], b"include_str", b"include_bytes"]
-            .iter()
-            .filter_map(|mac| strip_call_end(before, mac))
-            .any(|(b, _)| {
-                !b.last()
-                    .is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_' || c == b'$')
-            })
-            .then_some(())
+        let (before, _) = strip_call_open(before.strip_suffix(b"env")?)?;
+        let (before, _) = strip_call_open(before.strip_suffix(b"concat")?)?;
+        Some(before)
     }
 
     let mut mentioned = false;
@@ -1830,7 +1826,19 @@ fn out_dir_only_names_includes(files: &[PathBuf]) -> bool {
         };
         for at in memchr::memmem::find_iter(&text, b"OUT_DIR") {
             mentioned = true;
-            if names_include(&text[..at], &text[at + b"OUT_DIR".len()..]).is_none() {
+            let names_include = outer_call(&text[..at], &text[at + b"OUT_DIR".len()..])
+                .is_some_and(|before| {
+                    [&b"include"[..], b"include_str", b"include_bytes"]
+                        .iter()
+                        .filter_map(|mac| before.strip_suffix(*mac))
+                        .any(|b| {
+                            // Bytes past ASCII belong to a longer identifier.
+                            !b.last().is_some_and(|&c| {
+                                c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || !c.is_ascii()
+                            })
+                        })
+                });
+            if !names_include {
                 return false;
             }
         }
@@ -5077,6 +5085,9 @@ foo.rs:
             "include!(concat!(env!(\"OUT_DIR\"]), \"/a.rs\"));",
             "include! < concat!(env!(\"OUT_DIR\"), \"/a.rs\") >",
             "include_bytes { concat!(env!(\"OUT_DIR\"), \"/b\") }",
+            "my_include! { concat!(env!(\"OUT_DIR\"), \"/a.rs\") }",
+            "macro_rules! m { ($include:ident) => { $include![concat!(env!(\"OUT_DIR\"), \"/a\")] } }",
+            "\u{e9}include!(concat!(env!(\"OUT_DIR\"), \"/a.rs\"));",
         ] {
             assert!(
                 !check(&["include!(concat!(env!(\"OUT_DIR\"), \"/a.rs\"));", other]),
