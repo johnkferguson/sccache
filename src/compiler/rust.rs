@@ -1253,9 +1253,10 @@ impl FromArg for ArgExtern {
                 path: Some(path.into()),
             }),
             // Any other bare name would come from an `-L` path, which isn't
-            // hashed. The name may carry modifiers, as in `noprelude:alloc`.
+            // hashed. The name may carry modifiers, as in `force:alloc`.
             (name, None)
-                if SYSROOT_CRATES.contains(&name.rsplit(':').next().unwrap_or_default()) =>
+                if SYSROOT_CRATES
+                    .contains(&name.split_once(':').map_or(name.as_str(), |(_, n)| n)) =>
             {
                 Ok(ArgExtern { name, path: None })
             }
@@ -1952,12 +1953,15 @@ where
             let (mut sortables, rest): (Vec<_>, Vec<_>) = os_string_arguments
                 .iter()
                 // We exclude a few arguments from the hash:
-                //   -L, --extern, --out-dir, --diagnostic-width
+                //   -L, --extern with a path, --out-dir, --diagnostic-width
                 // These contain paths which aren't relevant to the output, and the compiler inputs
                 // in those paths (rlibs and static libs used in the compilation) are used as hash
-                // inputs below.
-                .filter(|&(arg, _)| {
-                    !(arg == "--extern"
+                // inputs below. A sysroot `--extern` has no path and no input, so it stays.
+                .filter(|&(arg, val)| {
+                    !((arg == "--extern"
+                        && val
+                            .as_ref()
+                            .is_some_and(|v| v.as_encoded_bytes().contains(&b'=')))
                         || arg == "-L"
                         || arg == "--check-cfg"
                         || arg == "--out-dir"
@@ -1970,7 +1974,7 @@ where
                 // A few argument types were not passed in a deterministic order
                 // by older versions of cargo: --extern, -L, --cfg. We'll filter the rest of those
                 // out, sort them, and append them to the rest of the arguments.
-                .partition(|&(arg, _)| arg == "--cfg");
+                .partition(|&(arg, _)| arg == "--cfg" || arg == "--extern");
             sortables.sort();
             rest.into_iter()
                 .chain(sortables)
@@ -3689,7 +3693,7 @@ LLVM version: 15.0.2
             .to_vec();
             parse_arguments(&args, ".".as_ref(), Some("linker".to_owned()))
         };
-        for name in ["proc_macro", "noprelude:alloc"] {
+        for name in ["proc_macro", "priv,force:alloc"] {
             match parse(name) {
                 CompilerArguments::Ok(a) => {
                     assert_eq!(a.externs, ovec!["libdep.rlib"]);
@@ -3707,7 +3711,7 @@ LLVM version: 15.0.2
             }
         }
         // A bare name outside the sysroot would come from an unhashed `-L` path.
-        for name in ["dep", "proc_macro2", "noprelude:dep"] {
+        for name in ["dep", "proc_macro2", "force:dep", "foo::std", "a:b:std"] {
             assert!(
                 matches!(
                     parse(name),
@@ -3748,6 +3752,31 @@ LLVM version: 15.0.2
         // An rlib is keyed the same whatever the value, or without it.
         assert_eq!(key("lib", None), key("lib", Some("linker-a")));
         assert_eq!(key("lib", Some("linker-a")), key("lib", Some("linker-b")));
+    }
+
+    #[test]
+    fn test_hash_bare_extern() {
+        let f = TestFixture::new();
+        let key = |externs: &[&'static str]| {
+            let mut args = vec![
+                "--emit",
+                "link",
+                "foo.rs",
+                "--out-dir",
+                "out",
+                "--crate-name",
+                "foo",
+                "--crate-type",
+                "lib",
+            ];
+            for e in externs {
+                args.extend(["--extern", e]);
+            }
+            hash_key(&f, &args, &[], nothing, false)
+        };
+        assert_ne!(key(&[]), key(&["proc_macro"]));
+        assert_ne!(key(&["alloc"]), key(&["force:alloc"]));
+        assert_eq!(key(&["alloc", "proc_macro"]), key(&["proc_macro", "alloc"]));
     }
 
     #[test]
