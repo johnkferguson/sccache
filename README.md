@@ -355,7 +355,9 @@ Base directories are stripped from the preprocessed source and from the compiler
 
 In an argument only the places that are expected to spell a pathname are considered: the whole argument, the value of an option written with an `=` (either half of a prefix map), and the value glued to a short option such as `-I`. A base directory appearing anywhere else is left alone, so a definition the compiler bakes into the output verbatim, `-DROOT="/home/user/project"`, still counts. A match also has to end where a path component ends, so a sibling `/home/user/project-docs` is not one.
 
-For Rust, base directories are also stripped from the working directory, from the `CARGO_*` environment variables such as `CARGO_MANIFEST_DIR`, and from the variables a crate reads with `env!` or `option_env!`, such as a build script's `OUT_DIR`. A hit then returns a crate compiled in another directory: its debug info and panic messages name that directory unless `--remap-path-prefix` maps it away, and so does any `env!("CARGO_MANIFEST_DIR")` the crate keeps.
+For Rust, base directories are also stripped from the working directory and from the `CARGO_*` environment variables such as `CARGO_MANIFEST_DIR`. A hit then returns a crate compiled in another directory: its debug info and panic messages name that directory unless `--remap-path-prefix` maps it away.
+
+A variable the crate reads with `env!` or `option_env!` keeps its base directory in the key, since the crate can keep the value: a test reading `env!("CARGO_MANIFEST_DIR")` or `env!("CARGO_BIN_EXE_app")` at run time must get its own checkout's path. Such a crate, and every crate built on it, compiles once per checkout. The exception is `OUT_DIR` when every mention of it in the crate's sources is the start of an `include!`, `include_str!` or `include_bytes!` path, as in `include!(concat!(env!("OUT_DIR"), "/gen.rs"))`, since the included file is hashed instead. A proc macro that reads a path with `std::env::var` is not seen by any of this.
 
 This is similar to ccache's `CCACHE_BASEDIR` and helps when:
 * Building the same project from different directories

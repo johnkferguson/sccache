@@ -27,8 +27,9 @@ server_startup_timeout_ms = 10000
 # spell a pathname are considered: the whole argument, the value of
 # an =-separated option, and the value glued to a short option.
 #
-# For Rust, also applies to the working directory, the CARGO_*
-# variables and the variables read with env!, such as OUT_DIR.
+# For Rust, also applies to the working directory and the CARGO_*
+# variables. A variable read with env! keeps its real value in the
+# key, except an OUT_DIR that only names include! paths.
 #
 # An entry containing `*`, `?` or `[` is a glob pattern, for checkouts
 # whose names can't be listed ahead of time, such as auto-named Git

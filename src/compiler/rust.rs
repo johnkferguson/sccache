@@ -1729,6 +1729,44 @@ fn strip_basedirs_os<'a>(value: &'a OsStr, basedirs: &[Vec<u8>]) -> Cow<'a, OsSt
     }
 }
 
+/// Whether `files` mention `OUT_DIR`, and only as the start of an `include!`,
+/// `include_str!` or `include_bytes!` path: `include!(concat!(env!("OUT_DIR"), "/x.rs"))`.
+/// Such an `OUT_DIR` never reaches the output.
+///
+/// Any other mention, such as `option_env!("OUT_DIR")`, a comment or a `std::env!`
+/// path, or a file that can't be read, gives `false`. An `env!("OUT_DIR")` coming
+/// from another crate's macro is not seen.
+fn out_dir_only_names_includes(files: &[PathBuf]) -> bool {
+    const PREFIX: &[u8] = b"concat!(env!(\"";
+    let mut mentioned = false;
+    for file in files {
+        let Ok(text) = fs::read(file) else {
+            return false;
+        };
+        let text: Vec<u8> = text
+            .into_iter()
+            .filter(|b| !b.is_ascii_whitespace())
+            .collect();
+        for at in memchr::memmem::find_iter(&text, b"OUT_DIR") {
+            mentioned = true;
+            let names_include = text[at..].starts_with(b"OUT_DIR\")")
+                && text[..at].strip_suffix(PREFIX).is_some_and(|before| {
+                    ["include!(", "include_str!(", "include_bytes!("]
+                        .iter()
+                        .filter_map(|mac| before.strip_suffix(mac.as_bytes()))
+                        .any(|b| {
+                            !b.last()
+                                .is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_')
+                        })
+                });
+            if !names_include {
+                return false;
+            }
+        }
+    }
+    mentioned
+}
+
 #[allow(clippy::suspicious_else_formatting)] // False positive
 #[async_trait]
 impl<T> CompilerHasher<T> for RustHasher
@@ -1926,11 +1964,28 @@ where
         // 8. Environment variables: Hash all environment variables listed in the rustc dep-info
         //    output. Additionally also has all environment variables starting with `CARGO_`,
         //    since those are not listed in dep-info but affect cacheability.
+        //
+        //    A crate can keep an env-dep's value, as `env!("CARGO_MANIFEST_DIR")` read at run
+        //    time, so a hit on a stripped value would hand it another checkout's path. Only an
+        //    `OUT_DIR` that just names files to include, whose contents are hashed above, is
+        //    stripped.
         env_deps.sort();
+        let out_dir_only_names_includes = match env_deps.iter().find(|(var, _)| var == "OUT_DIR") {
+            Some((_, val)) if matches!(strip_basedirs_os(val, basedirs), Cow::Owned(_)) => {
+                let files = source_files.clone();
+                pool.spawn_blocking(move || out_dir_only_names_includes(&files))
+                    .await?
+            }
+            _ => false,
+        };
         for (var, val) in env_deps.iter() {
             var.hash(&mut HashToDigest { digest: &mut m });
             m.update(b"=");
-            strip_basedirs_os(val, basedirs).hash(&mut HashToDigest { digest: &mut m });
+            if var == "OUT_DIR" && out_dir_only_names_includes {
+                strip_basedirs_os(val, basedirs).hash(&mut HashToDigest { digest: &mut m });
+            } else {
+                val.hash(&mut HashToDigest { digest: &mut m });
+            }
         }
         let mut env_vars: Vec<_> = env_vars
             .iter()
@@ -4508,6 +4563,13 @@ foo.rs:
         }
     }
 
+    fn includes_out_dir(root: &Path) -> Result<()> {
+        create_file(root, "foo.rs", |mut f| {
+            f.write_all(b"include!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"));\n")
+        })?;
+        Ok(())
+    }
+
     /// The same crate in two checkouts, keyed alike once both roots are basedirs.
     #[test]
     fn test_equal_hashes_basedirs() {
@@ -4535,7 +4597,7 @@ foo.rs:
                     ("CARGO_OUTSIDE".into(), outside.into()),
                 ],
                 &[("OUT_DIR", root.join("target").join("out").into())],
-                nothing,
+                includes_out_dir,
                 MockStorage::new(None, false).with_basedirs(basedirs),
             )
         }
@@ -4582,7 +4644,7 @@ foo.rs:
                     ),
                 ],
                 &[("OUT_DIR", root.join("target").join("out").into())],
-                nothing,
+                includes_out_dir,
                 MockStorage::new(None, false).with_basedirs(basedirs),
             )
         }
@@ -4629,6 +4691,99 @@ foo.rs:
             )
         };
         assert_ne!(key("".into()), key(root.clone().into()));
+    }
+
+    /// A crate that keeps an env-dep under a basedir, as an `env!` path read at
+    /// run time, keys apart in each checkout, so a hit never hands it another
+    /// checkout's path. An `OUT_DIR` that only names an `include!` still keys alike.
+    #[test_case("CARGO_MANIFEST_DIR", "", "", false ; "manifest dir")]
+    #[test_case("CARGO_BIN_EXE_foo", "target/debug/foo", "", false ; "bin exe")]
+    #[test_case("CARGO_TARGET_TMPDIR", "target/tmp", "", false ; "target tmpdir")]
+    #[test_case("OUT_DIR", "target/out", "const D: &str = env!(\"OUT_DIR\");", false ; "out dir read")]
+    #[test_case("OUT_DIR", "target/out", "include!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"));", true ; "out dir include")]
+    fn test_hash_env_dep_under_basedir(var: &str, sub: &str, src: &str, alike: bool) {
+        fn key(f: &TestFixture, var: &str, sub: &str, src: &str, basedirs: Vec<Vec<u8>>) -> String {
+            let root = f.tempdir.path();
+            let val = if sub.is_empty() {
+                root.to_owned()
+            } else {
+                root.join(sub)
+            };
+            hash_key_with(
+                f,
+                &[
+                    "--emit",
+                    "link",
+                    "foo.rs",
+                    "--out-dir",
+                    "out",
+                    "--crate-name",
+                    "foo",
+                    "--crate-type",
+                    "lib",
+                ],
+                &[("CARGO_MANIFEST_DIR".into(), root.into())],
+                &[(var, val.into())],
+                |root| {
+                    create_file(root, "foo.rs", |mut f| f.write_all(src.as_bytes()))?;
+                    Ok(())
+                },
+                MockStorage::new(None, false).with_basedirs(basedirs),
+            )
+        }
+
+        let a = TestFixture::new();
+        let b = TestFixture::new();
+        let both = vec![basedir(a.tempdir.path()), basedir(b.tempdir.path())];
+        assert_eq!(
+            key(&a, var, sub, src, both.clone()) == key(&b, var, sub, src, both),
+            alike
+        );
+    }
+
+    #[test]
+    fn test_out_dir_only_names_includes() {
+        let f = TestFixture::new();
+        let check = |texts: &[&str]| {
+            let files = texts
+                .iter()
+                .enumerate()
+                .map(|(i, text)| {
+                    let name = format!("f{i}.rs");
+                    create_file(f.tempdir.path(), &name, |mut f| {
+                        f.write_all(text.as_bytes())
+                    })
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            out_dir_only_names_includes(&files)
+        };
+        assert!(check(&["include!(concat!(env!(\"OUT_DIR\"), \"/a.rs\"));"]));
+        assert!(check(&[
+            "mod a {\n    include!(concat!(\n        env!(\"OUT_DIR\"),\n        \"/a.rs\"\n    ));\n}",
+            "const B: &[u8] = include_bytes!(concat!(env!(\"OUT_DIR\"), \"/b\"));",
+            "const C: &str = ::core::include_str!(concat!(env!(\"OUT_DIR\"), \"/c\"));",
+            "no mention",
+        ]));
+        // No mention at all: the env-dep came from somewhere unseen.
+        assert!(!check(&["fn main() {}"]));
+        for other in [
+            "const D: &str = env!(\"OUT_DIR\");",
+            "const D: Option<&str> = option_env!(\"OUT_DIR\");",
+            "include!(concat!(std::env!(\"OUT_DIR\"), \"/a.rs\"));",
+            "my_include!(concat!(env!(\"OUT_DIR\"), \"/a.rs\"));",
+            "include!(concat!(env!(\"OUT_DIR_X\"), \"/a.rs\"));",
+            "// OUT_DIR",
+        ] {
+            assert!(
+                !check(&["include!(concat!(env!(\"OUT_DIR\"), \"/a.rs\"));", other]),
+                "{other}"
+            );
+        }
+        assert!(!out_dir_only_names_includes(&[f
+            .tempdir
+            .path()
+            .join("missing.rs")]));
     }
 
     #[test_case(true ; "with preprocessor cache")]
