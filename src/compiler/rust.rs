@@ -1940,8 +1940,20 @@ where
             .cloned()
             .collect();
         env_vars.sort();
+        // Cargo sets CARGO_PRIMARY_PACKAGE only for packages named on its command line.
+        // rustc ignores it unless the source reads it with `env!`/`option_env!`, which
+        // puts it in the env-deps above. clippy-driver reads it under `--no-deps` to
+        // decide whether to lint at all, so only then does it change the output.
+        let clippy_no_deps = env_vars.iter().any(|(k, v)| {
+            k == "CLIPPY_ARGS"
+                && v.to_str()
+                    .is_some_and(|v| v.split("__CLIPPY_HACKERY__").any(|a| a == "--no-deps"))
+        });
         for (var, val) in env_vars.iter() {
             if !var.starts_with("CARGO_") {
+                continue;
+            }
+            if var == "CARGO_PRIMARY_PACKAGE" && !clippy_no_deps {
                 continue;
             }
 
@@ -4629,6 +4641,56 @@ foo.rs:
             )
         };
         assert_ne!(key("".into()), key(root.clone().into()));
+    }
+
+    /// A crate built with `cargo build -p` keys the same as when it's built as a
+    /// dependency, except where CARGO_PRIMARY_PACKAGE changes the output.
+    #[test]
+    fn test_hash_cargo_primary_package() {
+        let f = TestFixture::new();
+        let key = |env_vars: &[(&str, &str)], env_deps: &[(&str, OsString)]| {
+            let env_vars: Vec<(OsString, OsString)> =
+                env_vars.iter().map(|(k, v)| (k.into(), v.into())).collect();
+            hash_key_with(
+                &f,
+                &[
+                    "--emit",
+                    "link",
+                    "foo.rs",
+                    "--out-dir",
+                    "out",
+                    "--crate-name",
+                    "foo",
+                    "--crate-type",
+                    "lib",
+                ],
+                &env_vars,
+                env_deps,
+                nothing,
+                MockStorage::new(None, false),
+            )
+        };
+        let pkg = ("CARGO_PKG_NAME", "foo");
+        let primary = ("CARGO_PRIMARY_PACKAGE", "1");
+        assert_eq!(key(&[pkg], &[]), key(&[pkg, primary], &[]));
+
+        // The source reads it with `option_env!`.
+        assert_ne!(
+            key(&[pkg], &[("CARGO_PRIMARY_PACKAGE", "".into())]),
+            key(&[pkg, primary], &[("CARGO_PRIMARY_PACKAGE", "1".into())])
+        );
+
+        // `cargo clippy -- --no-deps` lints only primary packages.
+        let no_deps = (
+            "CLIPPY_ARGS",
+            "-Dwarnings__CLIPPY_HACKERY__--no-deps__CLIPPY_HACKERY__",
+        );
+        assert_ne!(
+            key(&[pkg, no_deps], &[]),
+            key(&[pkg, no_deps, primary], &[])
+        );
+        let lints = ("CLIPPY_ARGS", "-Dwarnings__CLIPPY_HACKERY__");
+        assert_eq!(key(&[pkg, lints], &[]), key(&[pkg, lints, primary], &[]));
     }
 
     #[test_case(true ; "with preprocessor cache")]

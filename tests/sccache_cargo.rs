@@ -43,6 +43,34 @@ fn test_rust_cargo_build_readonly() -> Result<()> {
     test_rust_cargo_cmd_readonly("build", SccacheTest::new(None)?)
 }
 
+/// Cargo sets CARGO_PRIMARY_PACKAGE for `-p itoa` but not when itoa is built as a
+/// dependency. Either build hits the entry the other wrote.
+#[test]
+#[serial]
+fn test_rust_cargo_build_primary_package() -> Result<()> {
+    let test_info = SccacheTest::new(None)?;
+    for args in [&["-p", "itoa"][..], &[], &["-p", "itoa"]] {
+        cargo_clean(&test_info)?;
+        Command::new(CARGO.as_os_str())
+            .args(["build", "--color=never"])
+            .args(args)
+            .envs(test_info.env.iter().cloned())
+            .current_dir(CRATE_DIR.as_os_str())
+            .assert()
+            .try_success()?;
+    }
+    test_info
+        .show_stats()?
+        .try_stdout(
+            predicates::str::contains(
+                r#""cache_hits":{"counts":{"Rust":2},"adv_counts":{"rust":2}}"#,
+            )
+            .from_utf8(),
+        )?
+        .try_success()?;
+    Ok(())
+}
+
 /// With SCCACHE_RUST_CRATE_TYPE_ALLOW_HASH in the build environment the bin is
 /// cached along with the libraries, and the binary restored from the cache runs.
 #[test]

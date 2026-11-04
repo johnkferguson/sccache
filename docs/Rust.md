@@ -6,6 +6,7 @@ sccache includes support for caching Rust compilation. This includes many caveat
 * `-o file` is not supported.
 * Compilation from stdin is not supported, a source file must be provided.
 * Values from `env!` require Rust >= 1.46 to be tracked in caching.
+* Every `CARGO_*` variable in the environment goes into the key, except a few that don't change the output. One of these is `CARGO_PRIMARY_PACKAGE`, so a crate built with `cargo build -p` hits the entry written when it was built as a dependency. It stays in the key when the crate reads it with `env!`/`option_env!`, or when `CLIPPY_ARGS` has `--no-deps`.
 * Procedural macros that read files from the filesystem may not be cached properly.
 * `rustc`'s incremental compilation needs to be disabled. See [The Cargo Book](https://doc.rust-lang.org/cargo/reference/profiles.html#incremental)
 * Crates that invoke the system linker cannot be cached. Examples are `bin`, `dylib`, `cdylib`, and `proc-macro` crates. Setting `SCCACHE_RUST_CRATE_TYPE_ALLOW_HASH` in the build environment (the one cargo runs sccache in) caches them anyway, except under `cargo check`, and never compiles them on a distributed build server. sccache doesn't know the linker's inputs, so its value goes into the cache key of these crates: give machines with different linkers or system libraries different values. Known gaps:
