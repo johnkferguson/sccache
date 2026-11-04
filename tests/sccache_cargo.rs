@@ -48,26 +48,29 @@ fn test_rust_cargo_build_readonly() -> Result<()> {
 #[test]
 #[serial]
 fn test_rust_cargo_build_primary_package() -> Result<()> {
-    let test_info = SccacheTest::new(None)?;
-    for args in [&["-p", "itoa"][..], &[], &["-p", "itoa"]] {
-        cargo_clean(&test_info)?;
-        Command::new(CARGO.as_os_str())
-            .args(["build", "--color=never"])
-            .args(args)
-            .envs(test_info.env.iter().cloned())
-            .current_dir(CRATE_DIR.as_os_str())
-            .assert()
+    let primary: &[&str] = &["-p", "itoa"];
+    for order in [[primary, &[]], [&[], primary]] {
+        let test_info = SccacheTest::new(None)?;
+        for args in order {
+            cargo_clean(&test_info)?;
+            Command::new(CARGO.as_os_str())
+                .args(["build", "--color=never"])
+                .args(args)
+                .envs(test_info.env.iter().cloned())
+                .current_dir(CRATE_DIR.as_os_str())
+                .assert()
+                .try_success()?;
+        }
+        test_info
+            .show_stats()?
+            .try_stdout(
+                predicates::str::contains(
+                    r#""cache_hits":{"counts":{"Rust":1},"adv_counts":{"rust":1}}"#,
+                )
+                .from_utf8(),
+            )?
             .try_success()?;
     }
-    test_info
-        .show_stats()?
-        .try_stdout(
-            predicates::str::contains(
-                r#""cache_hits":{"counts":{"Rust":2},"adv_counts":{"rust":2}}"#,
-            )
-            .from_utf8(),
-        )?
-        .try_success()?;
     Ok(())
 }
 
