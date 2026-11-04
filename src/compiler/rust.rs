@@ -1737,26 +1737,37 @@ fn strip_basedirs_os<'a>(value: &'a OsStr, basedirs: &[Vec<u8>]) -> Cow<'a, OsSt
 /// path, or a file that can't be read, gives `false`. An `env!("OUT_DIR")` coming
 /// from another crate's macro is not seen.
 fn out_dir_only_names_includes(files: &[PathBuf]) -> bool {
-    const PREFIX: &[u8] = b"concat!(env!(\"";
+    /// `text` without `tokens` at its end, allowing whitespace between them.
+    fn strip_tokens_end<'a>(mut text: &'a [u8], tokens: &[u8]) -> Option<&'a [u8]> {
+        for &c in tokens.iter().rev() {
+            text = text.trim_ascii_end().strip_suffix(&[c])?;
+        }
+        Some(text)
+    }
+
     let mut mentioned = false;
     for file in files {
+        // Dep-info also lists directories tracked by proc macros, which hold no source.
+        if file.is_dir() {
+            continue;
+        }
         let Ok(text) = fs::read(file) else {
             return false;
         };
-        let text: Vec<u8> = text
-            .into_iter()
-            .filter(|b| !b.is_ascii_whitespace())
-            .collect();
         for at in memchr::memmem::find_iter(&text, b"OUT_DIR") {
             mentioned = true;
-            let names_include = text[at..].starts_with(b"OUT_DIR\")")
-                && text[..at].strip_suffix(PREFIX).is_some_and(|before| {
-                    ["include!(", "include_str!(", "include_bytes!("]
+            let closed = text[at + b"OUT_DIR".len()..]
+                .strip_prefix(b"\"")
+                .is_some_and(|rest| rest.trim_ascii_start().starts_with(b")"));
+            let names_include = closed
+                && strip_tokens_end(&text[..at], b"concat!(env!(\"").is_some_and(|before| {
+                    [&b"include!("[..], b"include_str!(", b"include_bytes!("]
                         .iter()
-                        .filter_map(|mac| before.strip_suffix(mac.as_bytes()))
+                        .filter_map(|mac| strip_tokens_end(before, mac))
                         .any(|b| {
-                            !b.last()
-                                .is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_')
+                            !b.last().is_some_and(|&c| {
+                                c.is_ascii_alphanumeric() || c == b'_' || c == b'$'
+                            })
                         })
                 });
             if !names_include {
@@ -1970,22 +1981,26 @@ where
         //    `OUT_DIR` that just names files to include, whose contents are hashed above, is
         //    stripped.
         env_deps.sort();
-        let out_dir_only_names_includes = match env_deps.iter().find(|(var, _)| var == "OUT_DIR") {
-            Some((_, val)) if matches!(strip_basedirs_os(val, basedirs), Cow::Owned(_)) => {
-                let files = source_files.clone();
-                pool.spawn_blocking(move || out_dir_only_names_includes(&files))
-                    .await?
-            }
-            _ => false,
+        let out_dir_stripped = match env_deps.iter().find(|(var, _)| var == "OUT_DIR") {
+            Some((_, val)) => match strip_basedirs_os(val, basedirs) {
+                Cow::Owned(stripped) => {
+                    let files = source_files.clone();
+                    pool.spawn_blocking(move || out_dir_only_names_includes(&files))
+                        .await?
+                        .then_some(stripped)
+                }
+                Cow::Borrowed(_) => None,
+            },
+            None => None,
         };
         for (var, val) in env_deps.iter() {
             var.hash(&mut HashToDigest { digest: &mut m });
             m.update(b"=");
-            if var == "OUT_DIR" && out_dir_only_names_includes {
-                strip_basedirs_os(val, basedirs).hash(&mut HashToDigest { digest: &mut m });
-            } else {
-                val.hash(&mut HashToDigest { digest: &mut m });
+            match &out_dir_stripped {
+                Some(stripped) if var == "OUT_DIR" => stripped,
+                _ => val,
             }
+            .hash(&mut HashToDigest { digest: &mut m });
         }
         let mut env_vars: Vec<_> = env_vars
             .iter()
@@ -4664,8 +4679,8 @@ foo.rs:
         assert_ne!(key(&a, vec![glob.clone()]), key(&b, vec![glob]));
     }
 
-    /// An env-dep equal to a basedir is keyed apart from an unset one, which rustc
-    /// writes as `# env-dep:Y` for an `option_env!("Y")`.
+    /// A stripped env-dep equal to a basedir is keyed apart from an unset one, which
+    /// rustc writes as `# env-dep:OUT_DIR` for an `option_env!("OUT_DIR")`.
     #[test]
     fn test_hash_env_dep_equal_to_basedir_is_not_unset() {
         let f = TestFixture::new();
@@ -4685,8 +4700,8 @@ foo.rs:
                     "lib",
                 ],
                 &[],
-                &[("Y", val)],
-                nothing,
+                &[("OUT_DIR", val)],
+                includes_out_dir,
                 MockStorage::new(None, false).with_basedirs(vec![basedir(&root)]),
             )
         };
@@ -4772,6 +4787,7 @@ foo.rs:
             "const D: Option<&str> = option_env!(\"OUT_DIR\");",
             "include!(concat!(std::env!(\"OUT_DIR\"), \"/a.rs\"));",
             "my_include!(concat!(env!(\"OUT_DIR\"), \"/a.rs\"));",
+            "macro_rules! m { ($include:ident) => { $include!(concat!(env!(\"OUT_DIR\"), \"/a\")) } }",
             "include!(concat!(env!(\"OUT_DIR_X\"), \"/a.rs\"));",
             "// OUT_DIR",
         ] {
@@ -4780,6 +4796,15 @@ foo.rs:
                 "{other}"
             );
         }
+        // A directory tracked by a proc macro holds no source.
+        let mut with_dir = vec![f.tempdir.path().to_owned()];
+        with_dir.push(
+            create_file(f.tempdir.path(), "inc.rs", |mut f| {
+                f.write_all(b"include!(concat!(env!(\"OUT_DIR\"), \"/a.rs\"));")
+            })
+            .unwrap(),
+        );
+        assert!(out_dir_only_names_includes(&with_dir));
         assert!(!out_dir_only_names_includes(&[f
             .tempdir
             .path()
