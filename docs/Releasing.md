@@ -10,3 +10,7 @@ We use [`cargo-release`](https://crates.io/crates/cargo-release) to produce rele
 
 1. You must have authenticated to crates.io using `cargo login` to publish the sccache create there.
 2. cargo will not allow publishing a create if there are crates in the `[patch]` section in `Cargo.toml`.
+
+# Fork releases
+
+In `johnkferguson/sccache`, the upstream release job doesn't run. Pushing a tag named `v<version>-fork.<n>`, where `<version>` is the one in `Cargo.toml`, runs `.github/workflows/release.yml` instead. It publishes a GitHub release with `sccache-<tag>-x86_64-unknown-linux-musl.tar.gz`, a static binary with only the `s3` backend, and its `.sha256` file. The tag has to be on a commit that has `release.yml`.
