@@ -8,8 +8,10 @@ on:
   pull_request:
     paths:
       - .github/workflows/release.yml
+      - .github/workflows/actions.lock
       - Cargo.toml
       - Cargo.lock
+      - build.rs
 
 permissions:
   contents: read
@@ -49,9 +51,8 @@ jobs:
           version=$("$bin" --version | cut -d' ' -f2)
           if [ "$EVENT" = push ]; then
             tag=$GITHUB_REF_NAME
-            case $tag in
-              "v$version-fork."*) ;;
-              *)
+            case ${tag#"v$version-fork."} in
+              "$tag" | '' | *[!0-9]*)
                 echo "::error::Tag $tag doesn't match Cargo version $version; use v$version-fork.<n>"
                 exit 1
                 ;;
@@ -95,7 +96,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           NAME: ${{ needs.build.outputs.name }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
-            --title "$GITHUB_REF_NAME" \
-            --notes "sccache built from $GITHUB_SHA for $TARGET with only the s3 backend." \
-            "dist/$NAME.tar.gz" "dist/$NAME.tar.gz.sha256"
+          files=("dist/$NAME.tar.gz" "dist/$NAME.tar.gz.sha256")
+          # A re-run after a failed upload finds the release already created.
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber "${files[@]}"
+          else
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "$GITHUB_REF_NAME" \
+              --notes "sccache built from $GITHUB_SHA for $TARGET with only the s3 backend." \
+              "${files[@]}"
+          fi
