@@ -1,0 +1,101 @@
+# Fork releases: a v<version>-fork.<n> tag publishes a static Linux x86_64
+# sccache with only the s3 backend, for CI jobs to download instead of build.
+name: release
+
+on:
+  push:
+    tags: ['v*-fork.*']
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - Cargo.toml
+      - Cargo.lock
+
+permissions:
+  contents: read
+
+env:
+  TARGET: x86_64-unknown-linux-musl
+  RUSTUP_TOOLCHAIN: 1.91.0
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      name: ${{ steps.package.outputs.name }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust and musl
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target "$TARGET"
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --locked --release --no-default-features --features s3 --target "$TARGET"
+
+      - name: Package
+        id: package
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          bin=target/$TARGET/release/sccache
+          file "$bin"
+          file "$bin" | grep -q 'static' || { echo "::error::sccache isn't statically linked"; exit 1; }
+          version=$("$bin" --version | cut -d' ' -f2)
+          if [ "$EVENT" = push ]; then
+            tag=$GITHUB_REF_NAME
+            case $tag in
+              "v$version-fork."*) ;;
+              *)
+                echo "::error::Tag $tag doesn't match Cargo version $version; use v$version-fork.<n>"
+                exit 1
+                ;;
+            esac
+          else
+            tag=v$version-fork.0
+          fi
+          name=sccache-$tag-$TARGET
+          mkdir -p "dist/$name"
+          cp "$bin" LICENSE README.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" >"$name.tar.gz.sha256")
+          cat "dist/$name.tar.gz.sha256"
+          echo "name=$name" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            dist/${{ steps.package.outputs.name }}.tar.gz
+            dist/${{ steps.package.outputs.name }}.tar.gz.sha256
+          if-no-files-found: error
+
+  # A separate job, so the build doesn't run with a token that can write
+  # releases.
+  publish:
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: ${{ needs.build.outputs.name }}
+          path: dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAME: ${{ needs.build.outputs.name }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes "sccache built from $GITHUB_SHA for $TARGET with only the s3 backend." \
+            "dist/$NAME.tar.gz" "dist/$NAME.tar.gz.sha256"
